@@ -42,6 +42,13 @@ from spinup.utils.mpi_tools import mpi_fork, mpi_avg, proc_id, mpi_statistics_sc
 
 import time
 
+# Force GPU usage
+if not torch.cuda.is_available():
+    raise RuntimeError("CUDA is not available. This training requires GPU.")
+DEVICE = torch.device("cuda")
+print(f"Using device: {DEVICE}")
+print(f"GPU: {torch.cuda.get_device_name(0)}")
+
 # Load data from Hugging Face
 print("Loading training data from Hugging Face...")
 dataset = load_dataset("benstaf/nasdaq_2013_2023", data_files="train_data_deepseek_risk_2013_2018.csv")
@@ -179,7 +186,7 @@ class MLPActorCritic(nn.Module):
             a = pi.sample()
             logp_a = self.pi._log_prob_from_distribution(pi, a)
             v = self.v(obs)
-        return a.numpy(), v.numpy(), logp_a.numpy()
+        return a.cpu().numpy(), v.cpu().numpy(), logp_a.cpu().numpy()
 
     def act(self, obs):
         return self.step(obs)[0]
@@ -227,7 +234,7 @@ class CPPOBuffer:
         self.adv_buf = (self.adv_buf - adv_mean) / adv_std
         data = dict(obs=self.obs_buf, act=self.act_buf, ret=self.ret_buf,
                     adv=self.adv_buf, logp=self.logp_buf)
-        return {k: torch.as_tensor(v, dtype=torch.float32) for k, v in data.items()}
+        return {k: torch.as_tensor(v, dtype=torch.float32, device=DEVICE) for k, v in data.items()}
 
 
 # CPPO Algorithm
@@ -273,6 +280,7 @@ def cppo(env_fn,
     act_dim = env.action_space.shape
 
     ac = actor_critic(env.observation_space, env.action_space, **ac_kwargs)
+    ac = ac.to(DEVICE)  # Move model to GPU
     sync_params(ac)
 
     var_counts = tuple(core.count_vars(module) for module in [ac.pi, ac.v])
@@ -355,7 +363,7 @@ def cppo(env_fn,
         update_num = 0
 
         for t in range(local_steps_per_epoch):
-            a, v, logp = ac.step(torch.as_tensor(o, dtype=torch.float32))
+            a, v, logp = ac.step(torch.as_tensor(o, dtype=torch.float32, device=DEVICE))
 
             next_o, r, d, _ = env.step(a)
             ep_ret += r
@@ -403,7 +411,7 @@ def cppo(env_fn,
                 if epoch_ended and not terminal:
                     print('Warning: trajectory cut off by epoch at %d steps.' % ep_len, flush=True)
                 if timeout or epoch_ended:
-                    _, v, _ = ac.step(torch.as_tensor(o, dtype=torch.float32))
+                    _, v, _ = ac.step(torch.as_tensor(o, dtype=torch.float32, device=DEVICE))
                 else:
                     v = 0
                 buf.finish_path(v)
