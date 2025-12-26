@@ -34,7 +34,8 @@ from env_stocktrading_llm_risk import StockTradingEnv
 
 # Constants
 INDICATORS = ['macd', 'boll_ub', 'boll_lb', 'rsi_30', 'cci_30', 'dx_30', 'close_30_sma', 'close_60_sma']
-TRAINED_MODEL_DIR = 'trained_models'
+# Stateless: 模型保存到 Docker named volume
+TRAINED_MODEL_DIR = os.path.join(os.environ.get('MODELS_DIR', '/app/models'), 'finrl_deepseek', 'trained_models')
 os.makedirs(TRAINED_MODEL_DIR, exist_ok=True)
 
 
