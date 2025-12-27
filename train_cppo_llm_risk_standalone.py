@@ -23,8 +23,8 @@ INDICATORS = [
     'close_60_sma',
 ]
 
-# Model directory: use SHARED_MODEL_DIR env var (Docker named volume) or fallback to local
-TRAINED_MODEL_DIR = os.environ.get('SHARED_MODEL_DIR', 'trained_models')
+# Stateless: 模型保存到 Docker named volume
+TRAINED_MODEL_DIR = os.path.join(os.environ.get('MODELS_DIR', '/app/models'), 'finrl_deepseek', 'trained_models')
 os.makedirs(TRAINED_MODEL_DIR, exist_ok=True)
 print(f"Model directory: {TRAINED_MODEL_DIR}")
 
