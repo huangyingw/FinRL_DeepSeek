@@ -2,12 +2,16 @@
 # coding: utf-8
 # Standalone training script for CPPO-DeepSeek
 # Run with: OMPI_ALLOW_RUN_AS_ROOT=1 OMPI_ALLOW_RUN_AS_ROOT_CONFIRM=1 mpirun -np 4 python3 train_cppo_llm_risk_standalone.py
+#
+# 环境变量:
+#   DATA_SOURCE: 'clickhouse' 或 'huggingface' (默认: huggingface)
+#   TRAIN_START_DATE: 训练开始日期 (默认: 2018-01-01)
+#   TRAIN_END_DATE: 训练结束日期 (默认: 2023-12-31)
 
 import os
 import warnings
 warnings.filterwarnings('ignore')
 
-from datasets import load_dataset
 import pandas as pd
 from env_stocktrading_llm_risk import StockTradingEnv
 
@@ -51,11 +55,37 @@ DEVICE = torch.device("cuda")
 print(f"Using device: {DEVICE}")
 print(f"GPU: {torch.cuda.get_device_name(0)}")
 
-# Load data from Hugging Face
-print("Loading training data from Hugging Face...")
-dataset = load_dataset("benstaf/nasdaq_2013_2023", data_files="train_data_deepseek_risk_2013_2018.csv")
-train = pd.DataFrame(dataset['train'])
-train = train.drop('Unnamed: 0', axis=1)
+
+def load_data():
+    """根据 DATA_SOURCE 环境变量加载训练数据"""
+    data_source = os.environ.get('DATA_SOURCE', 'huggingface').lower()
+
+    if data_source == 'clickhouse':
+        print("Loading training data from ClickHouse...")
+        try:
+            from clickhouse_data_adapter import load_training_data
+            start_date = os.environ.get('TRAIN_START_DATE', '2018-01-01')
+            end_date = os.environ.get('TRAIN_END_DATE', '2023-12-31')
+            train, _ = load_training_data(start_date=start_date, end_date=end_date, test_ratio=0.0)
+            print(f"Loaded {len(train)} rows from ClickHouse ({start_date} to {end_date})")
+        except Exception as e:
+            print(f"ClickHouse 加载失败: {e}")
+            print("回退到 Hugging Face 数据...")
+            data_source = 'huggingface'
+
+    if data_source == 'huggingface':
+        print("Loading training data from Hugging Face...")
+        from datasets import load_dataset
+        dataset = load_dataset("benstaf/nasdaq_2013_2023", data_files="train_data_deepseek_risk_2013_2018.csv")
+        train = pd.DataFrame(dataset['train'])
+        if 'Unnamed: 0' in train.columns:
+            train = train.drop('Unnamed: 0', axis=1)
+
+    return train
+
+
+# Load data
+train = load_data()
 
 # Create a new index based on unique dates
 unique_dates = train['date'].unique()
