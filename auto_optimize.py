@@ -283,8 +283,13 @@ def train_and_evaluate(
         done = terminated or truncated
         val_ret += reward
 
-    # 计算收益率
-    final_value = val_env.state[0]  # 最终资产
+    # 计算收益率 (现金 + 持仓价值)
+    stock_dim = val_env.stock_dim
+    cash = val_env.state[0]
+    holdings = val_env.state[1:1+stock_dim]
+    prices = val_env.state[1+stock_dim:1+2*stock_dim]
+    holdings_value = sum(h * p for h, p in zip(holdings, prices))
+    final_value = cash + holdings_value
     returns = (final_value - initial_amount) / initial_amount
 
     logger.info(f"Trial {trial_name}: Val Return = {returns*100:.2f}%")
