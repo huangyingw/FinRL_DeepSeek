@@ -105,8 +105,28 @@ print(f"Stock Dimension: {stock_dimension}, State Space: {state_space}")
 buy_cost_list = sell_cost_list = [0.001] * stock_dimension
 num_stock_shares = [0] * stock_dimension
 
+# 超参数：自动从 best_params.json 读取（Optuna 优化结果）
+def load_best_params():
+    """从 Optuna 优化结果自动加载最佳超参数"""
+    import json
+    best_params_path = os.path.join(
+        os.environ.get('MODELS_DIR', '/app/models'),
+        'optuna_results', 'best_params.json'
+    )
+    if os.path.exists(best_params_path):
+        with open(best_params_path, 'r') as f:
+            data = json.load(f)
+            print(f"✅ Loaded best params from {best_params_path}")
+            return data.get('best_params', {})
+    print("⚠️ best_params.json not found, using defaults")
+    return {}
+
+BEST_PARAMS = load_best_params()
+HMAX = int(BEST_PARAMS.get('hmax', os.environ.get('HMAX', 100)))
+REWARD_SCALING = float(BEST_PARAMS.get('reward_scaling', os.environ.get('REWARD_SCALING', 1e-4)))
+
 env_kwargs = {
-    "hmax": 100,
+    "hmax": HMAX,
     "initial_amount": 1000000,
     "num_stock_shares": num_stock_shares,
     "buy_cost_pct": buy_cost_list,
@@ -115,7 +135,7 @@ env_kwargs = {
     "stock_dim": stock_dimension,
     "tech_indicator_list": INDICATORS,
     "action_space": stock_dimension,
-    "reward_scaling": 1e-4
+    "reward_scaling": REWARD_SCALING
 }
 
 e_train_gym = StockTradingEnv(df=train, **env_kwargs)
@@ -269,22 +289,22 @@ class CPPOBuffer:
         return {k: torch.as_tensor(v, dtype=torch.float32, device=DEVICE) for k, v in data.items()}
 
 
-# CPPO Algorithm
+# CPPO Algorithm - 自动从 best_params.json 读取超参数
 def cppo(env_fn,
          actor_critic=core.MLPActorCritic,
-         ac_kwargs=dict(hidden_sizes=[256, 128], activation=torch.nn.ReLU),
+         ac_kwargs=None,
          seed=42,
          steps_per_epoch=20000,
-         epochs=100,
-         gamma=0.995,
-         clip_ratio=0.7,
-         pi_lr=3e-5,
-         vf_lr=1e-4,
-         train_pi_iters=100,
-         train_v_iters=100,
-         lam=0.95,
+         epochs=None,
+         gamma=None,
+         clip_ratio=None,
+         pi_lr=None,
+         vf_lr=None,
+         train_pi_iters=None,
+         train_v_iters=None,
+         lam=None,
          max_ep_len=3000,
-         target_kl=0.35,
+         target_kl=None,
          logger_kwargs=dict(),
          save_freq=10,
          alpha=0.85,
@@ -297,6 +317,28 @@ def cppo(env_fn,
          lam_low_bound=0.001,
          delay=1.0,
          cvar_clip_ratio=0.05):
+    # 自动从 best_params.json 读取超参数，回退到环境变量，再回退到默认值
+    epochs = epochs or int(BEST_PARAMS.get('epochs', os.environ.get('EPOCHS', 100)))
+    gamma = gamma or float(BEST_PARAMS.get('gamma', os.environ.get('GAMMA', 0.995)))
+    clip_ratio = clip_ratio or float(BEST_PARAMS.get('clip_ratio', os.environ.get('CLIP_RATIO', 0.7)))
+    pi_lr = pi_lr or float(BEST_PARAMS.get('pi_lr', os.environ.get('PI_LR', 3e-5)))
+    vf_lr = vf_lr or float(BEST_PARAMS.get('vf_lr', os.environ.get('VF_LR', 1e-4)))
+    train_pi_iters = train_pi_iters or int(BEST_PARAMS.get('train_pi_iters', os.environ.get('TRAIN_PI_ITERS', 100)))
+    train_v_iters = train_v_iters or int(BEST_PARAMS.get('train_v_iters', os.environ.get('TRAIN_V_ITERS', 100)))
+    lam = lam or float(BEST_PARAMS.get('lam', os.environ.get('LAM', 0.95)))
+    target_kl = target_kl or float(BEST_PARAMS.get('target_kl', os.environ.get('TARGET_KL', 0.35)))
+
+    # 网络结构：固定使用 [512, 512]（更大容量）
+    hidden_size_1 = int(BEST_PARAMS.get('hidden_size_1', 512))
+    hidden_size_2 = int(BEST_PARAMS.get('hidden_size_2', 512))
+    ac_kwargs = ac_kwargs or dict(hidden_sizes=[hidden_size_1, hidden_size_2], activation=torch.nn.ReLU)
+
+    print(f"Training with optimized hyperparameters:")
+    print(f"  epochs={epochs}, gamma={gamma:.4f}, clip_ratio={clip_ratio:.4f}")
+    print(f"  pi_lr={pi_lr:.6f}, vf_lr={vf_lr:.6f}")
+    print(f"  train_pi_iters={train_pi_iters}, train_v_iters={train_v_iters}")
+    print(f"  lam={lam:.4f}, target_kl={target_kl:.4f}")
+    print(f"  hidden_sizes=[{hidden_size_1}, {hidden_size_2}]")
 
     setup_pytorch_for_mpi()
 
@@ -491,11 +533,8 @@ if __name__ == "__main__":
     import argparse
     parser = argparse.ArgumentParser()
     parser.add_argument('--env', type=str, default='env_train')
-    parser.add_argument('--hid', type=int, default=512)
-    parser.add_argument('--l', type=int, default=2)
     parser.add_argument('--seed', '-s', type=int, default=0)
     parser.add_argument('--cpu', type=int, default=4)
-    parser.add_argument('--epochs', type=int, default=100)
     parser.add_argument('--exp_name', type=str, default='cppo_deepseek')
     parser.add_argument('-f', '--file', type=str, help='Kernel connection file')
     parser.add_argument('extra_args', nargs=argparse.REMAINDER)
@@ -505,14 +544,15 @@ if __name__ == "__main__":
     from spinup.utils.run_utils import setup_logger_kwargs
     logger_kwargs = setup_logger_kwargs(args.exp_name, args.seed)
 
-    print(f"Starting CPPO-DeepSeek training with {args.epochs} epochs...")
-    print(f"Hidden layers: {args.hid} x {args.l}")
+    # 从环境变量读取超参数（由 cppo 函数内部处理）
+    epochs = int(os.environ.get('EPOCHS', 100))
+    print(f"Starting CPPO-DeepSeek training with {epochs} epochs...")
+    print(f"Hyperparameters loaded from environment variables")
 
     trained_cppo = cppo(lambda: env_train, actor_critic=MLPActorCritic,
-                        ac_kwargs=dict(hidden_sizes=[args.hid] * args.l),
-                        seed=args.seed, epochs=args.epochs, logger_kwargs=logger_kwargs)
+                        seed=args.seed, logger_kwargs=logger_kwargs)
 
     # Save the model
-    model_path = TRAINED_MODEL_DIR + f"/agent_cppo_deepseek_{args.epochs}_epochs.pth"
+    model_path = TRAINED_MODEL_DIR + f"/agent_cppo_deepseek_{epochs}_epochs.pth"
     torch.save(trained_cppo.state_dict(), model_path)
     print("Training finished and saved in " + model_path)
