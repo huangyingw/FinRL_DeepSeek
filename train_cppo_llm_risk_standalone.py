@@ -122,8 +122,9 @@ def load_best_params():
     return {}
 
 BEST_PARAMS = load_best_params()
-HMAX = int(BEST_PARAMS.get('hmax', os.environ.get('HMAX', 100)))
-REWARD_SCALING = float(BEST_PARAMS.get('reward_scaling', os.environ.get('REWARD_SCALING', 1e-4)))
+# 只从 best_params.json 读取，不使用环境变量回退
+HMAX = int(BEST_PARAMS.get('hmax', 100))
+REWARD_SCALING = float(BEST_PARAMS.get('reward_scaling', 1e-4))
 
 env_kwargs = {
     "hmax": HMAX,
@@ -317,18 +318,18 @@ def cppo(env_fn,
          lam_low_bound=0.001,
          delay=1.0,
          cvar_clip_ratio=0.05):
-    # 自动从 best_params.json 读取超参数，回退到环境变量，再回退到默认值
-    epochs = epochs or int(BEST_PARAMS.get('epochs', os.environ.get('EPOCHS', 100)))
-    gamma = gamma or float(BEST_PARAMS.get('gamma', os.environ.get('GAMMA', 0.995)))
-    clip_ratio = clip_ratio or float(BEST_PARAMS.get('clip_ratio', os.environ.get('CLIP_RATIO', 0.7)))
-    pi_lr = pi_lr or float(BEST_PARAMS.get('pi_lr', os.environ.get('PI_LR', 3e-5)))
-    vf_lr = vf_lr or float(BEST_PARAMS.get('vf_lr', os.environ.get('VF_LR', 1e-4)))
-    train_pi_iters = train_pi_iters or int(BEST_PARAMS.get('train_pi_iters', os.environ.get('TRAIN_PI_ITERS', 100)))
-    train_v_iters = train_v_iters or int(BEST_PARAMS.get('train_v_iters', os.environ.get('TRAIN_V_ITERS', 100)))
-    lam = lam or float(BEST_PARAMS.get('lam', os.environ.get('LAM', 0.95)))
-    target_kl = target_kl or float(BEST_PARAMS.get('target_kl', os.environ.get('TARGET_KL', 0.35)))
+    # 只从 best_params.json 读取超参数（Optuna 优化结果）
+    epochs = epochs or int(BEST_PARAMS.get('epochs', 100))
+    gamma = gamma or float(BEST_PARAMS.get('gamma', 0.995))
+    clip_ratio = clip_ratio or float(BEST_PARAMS.get('clip_ratio', 0.7))
+    pi_lr = pi_lr or float(BEST_PARAMS.get('pi_lr', 3e-5))
+    vf_lr = vf_lr or float(BEST_PARAMS.get('vf_lr', 1e-4))
+    train_pi_iters = train_pi_iters or int(BEST_PARAMS.get('train_pi_iters', 100))
+    train_v_iters = train_v_iters or int(BEST_PARAMS.get('train_v_iters', 100))
+    lam = lam or float(BEST_PARAMS.get('lam', 0.95))
+    target_kl = target_kl or float(BEST_PARAMS.get('target_kl', 0.35))
 
-    # 网络结构：固定使用 [512, 512]（更大容量）
+    # 网络结构：从 best_params.json 读取（默认 512x512）
     hidden_size_1 = int(BEST_PARAMS.get('hidden_size_1', 512))
     hidden_size_2 = int(BEST_PARAMS.get('hidden_size_2', 512))
     ac_kwargs = ac_kwargs or dict(hidden_sizes=[hidden_size_1, hidden_size_2], activation=torch.nn.ReLU)
