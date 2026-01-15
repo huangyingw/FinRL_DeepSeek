@@ -4,13 +4,12 @@ ClickHouse 数据适配器 for FinRL-DeepSeek 训练
 
 使用方法:
     from clickhouse_data_adapter import load_training_data
-    train_df, test_df = load_training_data(start_date='2018-01-01', end_date='2023-12-31')
+    train_df, test_df = load_training_data()
 
-环境变量:
-    CLICKHOUSE_HOST: ClickHouse 主机 (默认: localhost)
-    CLICKHOUSE_PORT: ClickHouse 端口 (默认: 9000)
-    CLICKHOUSE_USER: 用户名 (默认: default)
-    CLICKHOUSE_PASSWORD: 密码 (默认: 空)
+配置来源:
+    复用父项目 pkg.database.connection.ConnectionManager
+    - 非敏感配置: 从 config/settings.yaml 读取 (通过 EnvManager)
+    - 敏感数据: 通过 EnvManager → Doppler SDK 获取
 """
 
 import os
@@ -21,80 +20,38 @@ from typing import Tuple, List, Optional
 import pandas as pd
 import numpy as np
 
-# 添加父项目路径（仅用于引用 schema 常量）
+# 添加父项目路径，复用 pkg.database 封装层
 PROJECT_ROOT = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 sys.path.insert(0, PROJECT_ROOT)
 
-logger = logging.getLogger(__name__)
+from pkg.database.connection import ConnectionManager
+from pkg.database import schema
 
-# 表名常量（避免依赖 pkg.database.schema）
-DATABASE_NAME = "trading_data"
-TABLE_BARS_1D = "bars_1d"
-TABLE_NEWS_SENTIMENT = "news_sentiment"
+logger = logging.getLogger(__name__)
 
 
 def get_full_table_name(table_name: str) -> str:
     """获取完整表名"""
-    return f"{DATABASE_NAME}.{table_name}"
+    return f"{schema.DATABASE_NAME}.{table_name}"
 
 
-_client = None
-
-
-def init_connection():
-    """初始化 ClickHouse 连接 - 直接使用 clickhouse_driver，不依赖 EnvManager"""
-    global _client
-    if _client is not None:
-        return
-
-    try:
-        from clickhouse_driver import Client
-    except ImportError:
-        raise ImportError("clickhouse_driver not installed. Run: pip install clickhouse-driver")
-
-    # Docker 环境: 从环境变量获取配置
-    host = os.environ.get('CLICKHOUSE_HOST', 'localhost')
-    port = int(os.environ.get('CLICKHOUSE_PORT', 9000))
-    user = os.environ.get('CLICKHOUSE_USER', 'default')
-    password = os.environ.get('CLICKHOUSE_PASSWORD', '')
-    database = os.environ.get('CLICKHOUSE_DATABASE', 'trading_data')
-
-    logger.info(f"初始化 ClickHouse 连接: {host}:{port} (user: {user})")
-
-    _client = Client(
-        host=host,
-        port=port,
-        database=database,
-        user=user,
-        password=password,
-        settings={
-            'max_execution_time': 120,
-            'connect_timeout': 10
-        }
-    )
-
-    # 测试连接
-    _client.execute("SELECT 1")
-    logger.info("ClickHouse 连接成功")
-
-
-class SimpleConnection:
-    """简单的连接包装类，模拟 ConnectionManager 接口"""
-    def __init__(self, client):
-        self.client = client
-        self.conn_type = 'driver'
-
-    def execute(self, query, params=None):
-        if params:
-            return self.client.execute(query, params)
-        return self.client.execute(query)
+_conn_manager = None
 
 
 def get_connection():
-    """获取 ClickHouse 连接"""
-    global _client
-    init_connection()
-    return SimpleConnection(_client)
+    """
+    获取 ClickHouse 连接
+
+    复用父项目的 ConnectionManager，配置来源:
+    - 非敏感配置: EnvManager → config/settings.yaml
+    - 敏感数据 (密码): EnvManager → Doppler SDK
+    """
+    global _conn_manager
+    if _conn_manager is None:
+        _conn_manager = ConnectionManager()
+        _conn_manager.initialize()
+        logger.info("ClickHouse 连接已初始化 (通过 pkg.database.ConnectionManager)")
+    return _conn_manager
 
 # 技术指标列表（与 Hugging Face 数据集一致）
 INDICATORS = [
@@ -106,7 +63,7 @@ INDICATORS = [
 def get_ohlc_data(symbols: List[str], start_date: str, end_date: str) -> pd.DataFrame:
     """从 ClickHouse 获取 OHLC 数据（每日聚合）"""
     conn = get_connection()
-    table = get_full_table_name(TABLE_BARS_1D)
+    table = get_full_table_name(schema.TABLE_BARS_1D)
 
     symbols_str = ", ".join([f"'{s}'" for s in symbols])
 
@@ -182,7 +139,7 @@ def get_sentiment_data(symbols: List[str], start_date: str, end_date: str) -> pd
     将 sentiment 字符串转换为数值: positive=1, neutral=0, negative=-1
     """
     conn = get_connection()
-    table = get_full_table_name(TABLE_NEWS_SENTIMENT)
+    table = get_full_table_name(schema.TABLE_NEWS_SENTIMENT)
 
     symbols_str = ", ".join([f"'{s}'" for s in symbols])
 
@@ -269,9 +226,33 @@ def get_nasdaq100_symbols() -> List[str]:
     ]
 
 
+def get_available_date_range() -> Tuple[str, str]:
+    """
+    从数据库查询可用数据的日期范围
+
+    Returns:
+        (start_date, end_date): 数据库中最早和最晚的日期
+    """
+    conn = get_connection()
+    table = get_full_table_name(schema.TABLE_BARS_1D)
+
+    query = f"""
+        SELECT
+            formatDateTime(min(timestamp), '%Y-%m-%d') as min_date,
+            formatDateTime(max(timestamp), '%Y-%m-%d') as max_date
+        FROM {table}
+    """
+    result = conn.execute(query)
+    if result and result[0]:
+        min_date, max_date = result[0]
+        logger.info(f"数据库日期范围: {min_date} ~ {max_date}")
+        return min_date, max_date
+    return '2018-01-01', '2023-12-31'  # 回退默认值
+
+
 def load_training_data(
-    start_date: str = '2018-01-01',
-    end_date: str = '2023-12-31',
+    start_date: Optional[str] = None,
+    end_date: Optional[str] = None,
     test_ratio: float = 0.2,
     symbols: Optional[List[str]] = None
 ) -> Tuple[pd.DataFrame, pd.DataFrame]:
@@ -279,14 +260,22 @@ def load_training_data(
     从 ClickHouse 加载训练和测试数据
 
     Args:
-        start_date: 开始日期
-        end_date: 结束日期
-        test_ratio: 测试集比例
+        start_date: 开始日期 (默认: 数据库最早日期)
+        end_date: 结束日期 (默认: 数据库最新日期)
+        test_ratio: 测试集比例 (默认: 0.2)
         symbols: 股票列表，默认使用 NASDAQ-100
 
     Returns:
         train_df, test_df: 训练和测试数据
     """
+    # 动态获取日期范围
+    if start_date is None or end_date is None:
+        db_start, db_end = get_available_date_range()
+        if start_date is None:
+            start_date = db_start
+        if end_date is None:
+            end_date = db_end
+
     if symbols is None:
         symbols = get_nasdaq100_symbols()
 
