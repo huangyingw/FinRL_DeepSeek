@@ -299,23 +299,23 @@ def train_and_evaluate(
 
 def objective(trial: Trial, train_df: pd.DataFrame, val_df: pd.DataFrame) -> float:
     """Optuna 目标函数"""
-    # 超参数搜索空间
+    # 超参数搜索空间（扩展范围以支持更大网络和更长训练）
     params = {
-        'epochs': trial.suggest_int('epochs', 20, 50),
+        'epochs': trial.suggest_int('epochs', 50, 150),  # 扩展 epochs 范围
         'gamma': trial.suggest_float('gamma', 0.95, 0.999),
-        'clip_ratio': trial.suggest_float('clip_ratio', 0.1, 0.3),
+        'clip_ratio': trial.suggest_float('clip_ratio', 0.1, 0.8),  # 扩展 clip_ratio 范围
         'pi_lr': trial.suggest_float('pi_lr', 1e-5, 1e-3, log=True),
         'vf_lr': trial.suggest_float('vf_lr', 1e-5, 1e-3, log=True),
-        'train_pi_iters': trial.suggest_int('train_pi_iters', 40, 100),
-        'train_v_iters': trial.suggest_int('train_v_iters', 40, 100),
+        'train_pi_iters': trial.suggest_int('train_pi_iters', 40, 120),
+        'train_v_iters': trial.suggest_int('train_v_iters', 40, 120),
         'lam': trial.suggest_float('lam', 0.9, 0.99),
-        'target_kl': trial.suggest_float('target_kl', 0.01, 0.05),
+        'target_kl': trial.suggest_float('target_kl', 0.01, 0.4),  # 扩展 target_kl 范围
         'hmax': trial.suggest_int('hmax', 50, 200),
         'initial_amount': 1000000,
         'reward_scaling': trial.suggest_float('reward_scaling', 1e-5, 1e-3, log=True),
         'hidden_sizes': (
-            trial.suggest_categorical('hidden_size_1', [64, 128, 256]),
-            trial.suggest_categorical('hidden_size_2', [64, 128, 256]),
+            trial.suggest_categorical('hidden_size_1', [64, 128, 256, 512]),  # 添加 512
+            trial.suggest_categorical('hidden_size_2', [64, 128, 256, 512]),  # 添加 512
         ),
         'trial_name': f"trial_{trial.number}"
     }
