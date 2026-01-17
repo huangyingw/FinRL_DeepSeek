@@ -7,7 +7,7 @@ ClickHouse 数据适配器 for FinRL-DeepSeek 训练
     train_df, test_df = load_training_data()
 
 配置来源:
-    复用父项目 pkg.database.connection.ConnectionManager
+    复用父项目 pkg.database.repository
     - 非敏感配置: 从 config/settings.yaml 读取 (通过 EnvManager)
     - 敏感数据: 通过 EnvManager → Doppler SDK 获取
 """
@@ -15,7 +15,7 @@ ClickHouse 数据适配器 for FinRL-DeepSeek 训练
 import os
 import sys
 import logging
-from datetime import datetime, timedelta
+from datetime import datetime
 from typing import Tuple, List, Optional
 import pandas as pd
 import numpy as np
@@ -24,34 +24,9 @@ import numpy as np
 PROJECT_ROOT = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 sys.path.insert(0, PROJECT_ROOT)
 
-from pkg.database.connection import ConnectionManager
-from pkg.database import schema
+from pkg.database import repository as db
 
 logger = logging.getLogger(__name__)
-
-
-def get_full_table_name(table_name: str) -> str:
-    """获取完整表名"""
-    return f"{schema.DATABASE_NAME}.{table_name}"
-
-
-_conn_manager = None
-
-
-def get_connection():
-    """
-    获取 ClickHouse 连接
-
-    复用父项目的 ConnectionManager，配置来源:
-    - 非敏感配置: EnvManager → config/settings.yaml
-    - 敏感数据 (密码): EnvManager → Doppler SDK
-    """
-    global _conn_manager
-    if _conn_manager is None:
-        _conn_manager = ConnectionManager()
-        _conn_manager.initialize()
-        logger.info("ClickHouse 连接已初始化 (通过 pkg.database.ConnectionManager)")
-    return _conn_manager
 
 # 技术指标列表（与 Hugging Face 数据集一致）
 INDICATORS = [
@@ -60,35 +35,56 @@ INDICATORS = [
 ]
 
 
+def _ensure_db_initialized():
+    """确保数据库已初始化"""
+    if not db.is_initialized():
+        db.initialize()
+        logger.info("数据库已初始化 (通过 pkg.database.repository)")
+
+
 def get_ohlc_data(symbols: List[str], start_date: str, end_date: str) -> pd.DataFrame:
-    """从 ClickHouse 获取 OHLC 数据（每日聚合）"""
-    conn = get_connection()
-    table = get_full_table_name(schema.TABLE_BARS_1D)
+    """从 ClickHouse 获取 OHLC 数据（每日聚合）
 
-    symbols_str = ", ".join([f"'{s}'" for s in symbols])
-
-    # 使用聚合函数获取每日唯一数据（bars_1d 表可能有多条同日记录）
-    query = f"""
-        SELECT
-            symbol as tic,
-            toDate(timestamp) as date,
-            argMin(open, timestamp) as open,
-            max(high) as high,
-            min(low) as low,
-            argMax(close, timestamp) as close,
-            sum(volume) as volume
-        FROM {table}
-        WHERE symbol IN ({symbols_str})
-          AND timestamp >= '{start_date}'
-          AND timestamp <= '{end_date}'
-        GROUP BY symbol, toDate(timestamp)
-        ORDER BY date, symbol
+    使用 pkg.database.repository 封装层，不直接写 SQL
     """
-
-    result = conn.execute(query)
-    df = pd.DataFrame(result, columns=['tic', 'date', 'open', 'high', 'low', 'close', 'volume'])
-    df['date'] = pd.to_datetime(df['date']).dt.strftime('%Y-%m-%d')
+    _ensure_db_initialized()
+    df = db.get_bars_df_by_date(symbols, '1d', start_date, end_date)
+    if not df.empty:
+        df['date'] = pd.to_datetime(df['date']).dt.strftime('%Y-%m-%d')
     return df
+
+
+def get_sentiment_data(symbols: List[str], start_date: str, end_date: str) -> pd.DataFrame:
+    """从 ClickHouse 获取情感数据
+
+    使用 pkg.database.repository 封装层，不直接写 SQL
+    """
+    _ensure_db_initialized()
+    try:
+        df = db.get_sentiment_df(symbols, start_date, end_date)
+        if not df.empty:
+            df['date'] = pd.to_datetime(df['date']).dt.strftime('%Y-%m-%d')
+        return df
+    except Exception as e:
+        logger.warning(f"无法获取情感数据: {e}")
+        return pd.DataFrame(columns=['tic', 'date', 'avg_sentiment'])
+
+
+def get_available_date_range() -> Tuple[str, str]:
+    """从数据库查询可用数据的日期范围
+
+    使用 pkg.database.repository 封装层，不直接写 SQL
+    """
+    _ensure_db_initialized()
+    try:
+        min_date, max_date = db.get_date_range('1d')
+        start = min_date.strftime('%Y-%m-%d')
+        end = max_date.strftime('%Y-%m-%d')
+        logger.info(f"数据库日期范围: {start} ~ {end}")
+        return start, end
+    except Exception as e:
+        logger.warning(f"获取日期范围失败: {e}，使用默认值")
+        return '2018-01-01', '2023-12-31'
 
 
 def calculate_technical_indicators(df: pd.DataFrame) -> pd.DataFrame:
@@ -130,78 +126,24 @@ def calculate_technical_indicators(df: pd.DataFrame) -> pd.DataFrame:
     return pd.concat(result_dfs, ignore_index=True)
 
 
-def get_sentiment_data(symbols: List[str], start_date: str, end_date: str) -> pd.DataFrame:
-    """从 ClickHouse 获取情感数据
-
-    news_sentiment 表结构:
-    - symbol, published_at, sentiment ('positive', 'negative', 'neutral')
-
-    将 sentiment 字符串转换为数值: positive=1, neutral=0, negative=-1
-    """
-    conn = get_connection()
-    table = get_full_table_name(schema.TABLE_NEWS_SENTIMENT)
-
-    symbols_str = ", ".join([f"'{s}'" for s in symbols])
-
-    # 使用 published_at 代替 timestamp, 将 sentiment 字符串转换为数值
-    query = f"""
-        SELECT
-            symbol as tic,
-            toDate(published_at) as date,
-            avg(
-                CASE sentiment
-                    WHEN 'positive' THEN 1.0
-                    WHEN 'negative' THEN -1.0
-                    ELSE 0.0
-                END
-            ) as avg_sentiment,
-            count() as news_count
-        FROM {table}
-        WHERE symbol IN ({symbols_str})
-          AND published_at >= '{start_date}'
-          AND published_at <= '{end_date}'
-        GROUP BY symbol, toDate(published_at)
-        ORDER BY date, symbol
-    """
-
-    try:
-        result = conn.execute(query)
-        df = pd.DataFrame(result, columns=['tic', 'date', 'avg_sentiment', 'news_count'])
-        df['date'] = pd.to_datetime(df['date']).dt.strftime('%Y-%m-%d')
-        return df
-    except Exception as e:
-        logger.warning(f"无法获取情感数据: {e}，将使用模拟数据")
-        return pd.DataFrame(columns=['tic', 'date', 'avg_sentiment', 'news_count'])
-
-
 def convert_sentiment_to_score(sentiment: float) -> int:
-    """
-    将情感分数 (-1.0 到 1.0) 转换为 1-5 评分
-    1 = 非常消极, 3 = 中性, 5 = 非常积极
-    """
+    """将情感分数 (-1.0 到 1.0) 转换为 1-5 评分"""
     if pd.isna(sentiment):
-        return 0  # 0 表示无数据
-    # 线性映射: [-1, 1] -> [1, 5]
+        return 0
     score = int((sentiment + 1) * 2 + 1)
     return max(1, min(5, score))
 
 
 def calculate_risk_score(df: pd.DataFrame, window: int = 20) -> pd.DataFrame:
-    """
-    计算风险评分 (1-5)
-    基于波动率和价格变化
-    1 = 低风险, 5 = 高风险
-    """
+    """计算风险评分 (1-5)"""
     result_dfs = []
 
     for tic in df['tic'].unique():
         tic_df = df[df['tic'] == tic].copy().sort_values('date')
 
-        # 计算收益率波动
         tic_df['return'] = tic_df['close'].pct_change()
         tic_df['volatility'] = tic_df['return'].rolling(window=window).std()
 
-        # 波动率分位数转换为风险评分
         vol_percentile = tic_df['volatility'].rank(pct=True)
         tic_df['llm_risk'] = (vol_percentile * 4 + 1).round().fillna(3).astype(int)
         tic_df['llm_risk'] = tic_df['llm_risk'].clip(1, 5)
@@ -213,7 +155,6 @@ def calculate_risk_score(df: pd.DataFrame, window: int = 20) -> pd.DataFrame:
 
 def get_nasdaq100_symbols() -> List[str]:
     """获取 NASDAQ-100 股票列表"""
-    # 常见的 NASDAQ-100 成分股
     return [
         'AAPL', 'MSFT', 'AMZN', 'NVDA', 'GOOGL', 'META', 'TSLA', 'AVGO', 'COST', 'NFLX',
         'AMD', 'ADBE', 'QCOM', 'PEP', 'CSCO', 'INTC', 'TMUS', 'CMCSA', 'TXN', 'AMGN',
@@ -226,38 +167,13 @@ def get_nasdaq100_symbols() -> List[str]:
     ]
 
 
-def get_available_date_range() -> Tuple[str, str]:
-    """
-    从数据库查询可用数据的日期范围
-
-    Returns:
-        (start_date, end_date): 数据库中最早和最晚的日期
-    """
-    conn = get_connection()
-    table = get_full_table_name(schema.TABLE_BARS_1D)
-
-    query = f"""
-        SELECT
-            formatDateTime(min(timestamp), '%Y-%m-%d') as min_date,
-            formatDateTime(max(timestamp), '%Y-%m-%d') as max_date
-        FROM {table}
-    """
-    result = conn.execute(query)
-    if result and result[0]:
-        min_date, max_date = result[0]
-        logger.info(f"数据库日期范围: {min_date} ~ {max_date}")
-        return min_date, max_date
-    return '2018-01-01', '2023-12-31'  # 回退默认值
-
-
 def load_training_data(
     start_date: Optional[str] = None,
     end_date: Optional[str] = None,
     test_ratio: float = 0.2,
     symbols: Optional[List[str]] = None
 ) -> Tuple[pd.DataFrame, pd.DataFrame]:
-    """
-    从 ClickHouse 加载训练和测试数据
+    """从 ClickHouse 加载训练和测试数据
 
     Args:
         start_date: 开始日期 (默认: 数据库最早日期)
@@ -298,7 +214,7 @@ def load_training_data(
         df = df.merge(sentiment_df, on=['tic', 'date'], how='left')
         df['llm_sentiment'] = df['avg_sentiment'].apply(convert_sentiment_to_score)
     else:
-        df['llm_sentiment'] = 0  # 无情感数据
+        df['llm_sentiment'] = 0
 
     # 4. 计算风险评分
     df = calculate_risk_score(df)
@@ -306,21 +222,20 @@ def load_training_data(
     # 5. 填充缺失值
     df = df.fillna({
         'llm_sentiment': 0,
-        'llm_risk': 3,  # 中性风险
+        'llm_risk': 3,
         'macd': 0, 'boll_ub': 0, 'boll_lb': 0,
         'rsi_30': 50, 'cci_30': 0, 'dx_30': 0,
         'close_30_sma': 0, 'close_60_sma': 0
     })
 
-    # 6. 删除包含 NaN 的行（主要是初始窗口期）
+    # 6. 删除包含 NaN 的行
     df = df.dropna()
 
-    # 7. 确保每日股票数量一致（FinRL 环境要求）
+    # 7. 确保每日股票数量一致
     date_counts = df.groupby('date')['tic'].count()
     valid_dates = date_counts[date_counts == date_counts.max()].index.tolist()
     df = df[df['date'].isin(valid_dates)]
 
-    # 只保留所有日期都有数据的股票
     n_dates = df['date'].nunique()
     tic_counts = df.groupby('tic')['date'].count()
     valid_tics = tic_counts[tic_counts == n_dates].index.tolist()
@@ -328,76 +243,61 @@ def load_training_data(
 
     logger.info(f"数据清洗后: {len(df)} 行, {df['tic'].nunique()} 只股票, {df['date'].nunique()} 天")
 
-    # 7. 按日期划分训练/测试集
+    # 8. 按日期划分训练/测试集
     unique_dates = sorted(df['date'].unique())
 
     if test_ratio <= 0 or len(unique_dates) == 0:
-        # 无测试集，全部作为训练集
         train_df = df.reset_index(drop=True)
         test_df = pd.DataFrame(columns=df.columns)
     else:
         split_idx = int(len(unique_dates) * (1 - test_ratio))
-        split_idx = min(split_idx, len(unique_dates) - 1)  # 防止越界
+        split_idx = min(split_idx, len(unique_dates) - 1)
         split_date = unique_dates[split_idx]
 
         train_df = df[df['date'] < split_date].reset_index(drop=True)
         test_df = df[df['date'] >= split_date].reset_index(drop=True)
 
     logger.info(f"训练集: {len(train_df)} 行, 测试集: {len(test_df)} 行")
-    if len(train_df) > 0:
-        logger.info(f"训练集日期: {train_df['date'].min()} ~ {train_df['date'].max()}")
-    if len(test_df) > 0:
-        logger.info(f"测试集日期: {test_df['date'].min()} ~ {test_df['date'].max()}")
-
     return train_df, test_df
 
 
-def create_mock_data_for_testing(n_stocks: int = 10, n_days: int = 500) -> pd.DataFrame:
-    """
-    创建模拟数据用于测试（当 ClickHouse 不可用时）
-    """
-    np.random.seed(42)
-    symbols = [f'TEST{i:02d}' for i in range(n_stocks)]
-    dates = pd.date_range(end=datetime.now(), periods=n_days, freq='D')
+def create_mock_data_for_testing() -> pd.DataFrame:
+    """创建模拟数据用于测试"""
+    dates = pd.date_range('2023-01-01', '2023-12-31', freq='D')
+    symbols = ['AAPL', 'MSFT', 'GOOGL']
 
     data = []
     for symbol in symbols:
-        base_price = np.random.uniform(50, 500)
-        returns = np.random.normal(0.0005, 0.02, n_days)
-        prices = base_price * np.cumprod(1 + returns)
-
-        for i, (date, price) in enumerate(zip(dates, prices)):
+        base_price = 100 + np.random.randn() * 20
+        for date in dates:
+            price = base_price * (1 + np.random.randn() * 0.02)
             data.append({
                 'tic': symbol,
                 'date': date.strftime('%Y-%m-%d'),
-                'open': price * (1 + np.random.uniform(-0.01, 0.01)),
-                'high': price * (1 + np.random.uniform(0, 0.02)),
-                'low': price * (1 - np.random.uniform(0, 0.02)),
+                'open': price,
+                'high': price * 1.01,
+                'low': price * 0.99,
                 'close': price,
-                'volume': int(np.random.uniform(1e6, 1e8)),
-                'llm_sentiment': np.random.choice([0, 1, 2, 3, 4, 5], p=[0.3, 0.1, 0.1, 0.2, 0.15, 0.15]),
-                'llm_risk': np.random.choice([1, 2, 3, 4, 5], p=[0.1, 0.2, 0.4, 0.2, 0.1]),
+                'volume': int(1000000 * (1 + np.random.rand())),
+                'macd': np.random.randn() * 0.5,
+                'boll_ub': price * 1.02,
+                'boll_lb': price * 0.98,
+                'rsi_30': 50 + np.random.randn() * 10,
+                'cci_30': np.random.randn() * 50,
+                'dx_30': 20 + np.random.rand() * 30,
+                'close_30_sma': price,
+                'close_60_sma': price,
+                'llm_sentiment': np.random.choice([1, 2, 3, 4, 5]),
+                'llm_risk': np.random.choice([1, 2, 3, 4, 5])
             })
 
-    df = pd.DataFrame(data)
-
-    # 添加技术指标
-    for indicator in INDICATORS:
-        df[indicator] = np.random.randn(len(df))
-
-    return df
+    return pd.DataFrame(data)
 
 
 if __name__ == "__main__":
-    # 测试
     logging.basicConfig(level=logging.INFO)
-
     try:
-        train_df, test_df = load_training_data(
-            start_date='2020-01-01',
-            end_date='2023-12-31',
-            symbols=['AAPL', 'MSFT', 'GOOGL', 'AMZN', 'NVDA']
-        )
+        train_df, test_df = load_training_data()
         print(f"Train shape: {train_df.shape}")
         print(f"Test shape: {test_df.shape}")
         print(f"\nColumns: {train_df.columns.tolist()}")
@@ -407,4 +307,3 @@ if __name__ == "__main__":
         print("使用模拟数据测试...")
         mock_df = create_mock_data_for_testing()
         print(f"Mock data shape: {mock_df.shape}")
-        print(f"\nColumns: {mock_df.columns.tolist()}")
