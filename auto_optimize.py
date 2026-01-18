@@ -36,20 +36,21 @@ os.makedirs(RESULTS_DIR, exist_ok=True)
 
 def load_data():
     """加载训练和验证数据"""
-    data_source = os.environ.get('DATA_SOURCE', 'huggingface').lower()
+    data_source = os.environ.get('DATA_SOURCE', 'clickhouse').lower()
 
     if data_source == 'clickhouse':
         logger.info("从 ClickHouse 加载数据...")
         try:
             from clickhouse_data_adapter import load_training_data
-            start_date = os.environ.get('TRAIN_START_DATE', '2018-01-01')
-            end_date = os.environ.get('TRAIN_END_DATE', '2023-12-31')
+            # 使用 lookback_days 控制数据量，默认约5年
+            lookback_days = int(os.environ.get('LOOKBACK_DAYS', 365 * 5))
             train_df, val_df = load_training_data(
-                start_date=start_date,
-                end_date=end_date,
+                lookback_days=lookback_days,
                 test_ratio=0.2
             )
             logger.info(f"ClickHouse 数据: 训练 {len(train_df)} 行, 验证 {len(val_df)} 行")
+            if len(train_df) > 0:
+                logger.info(f"日期范围: {train_df['date'].min()} ~ {val_df['date'].max() if len(val_df) > 0 else train_df['date'].max()}")
             return train_df, val_df
         except Exception as e:
             logger.warning(f"ClickHouse 加载失败: {e}, 回退到 Hugging Face")

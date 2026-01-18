@@ -171,26 +171,38 @@ def load_training_data(
     start_date: Optional[str] = None,
     end_date: Optional[str] = None,
     test_ratio: float = 0.2,
-    symbols: Optional[List[str]] = None
+    symbols: Optional[List[str]] = None,
+    lookback_days: Optional[int] = None
 ) -> Tuple[pd.DataFrame, pd.DataFrame]:
     """从 ClickHouse 加载训练和测试数据
 
     Args:
-        start_date: 开始日期 (默认: 数据库最早日期)
+        start_date: 开始日期 (默认: 根据 lookback_days 或数据库最早日期)
         end_date: 结束日期 (默认: 数据库最新日期)
         test_ratio: 测试集比例 (默认: 0.2)
         symbols: 股票列表，默认使用 NASDAQ-100
+        lookback_days: 向前回溯天数，用于限制数据量 (默认: None 表示使用所有数据)
+                      例如: lookback_days=365*3 表示使用最近3年数据
 
     Returns:
         train_df, test_df: 训练和测试数据
     """
     # 动态获取日期范围
-    if start_date is None or end_date is None:
-        db_start, db_end = get_available_date_range()
-        if start_date is None:
+    db_start, db_end = get_available_date_range()
+
+    if end_date is None:
+        end_date = db_end
+
+    if start_date is None:
+        if lookback_days is not None:
+            # 使用 lookback_days 计算开始日期
+            from datetime import datetime, timedelta
+            end_dt = datetime.strptime(end_date, '%Y-%m-%d')
+            start_dt = end_dt - timedelta(days=lookback_days)
+            start_date = max(start_dt.strftime('%Y-%m-%d'), db_start)
+            logger.info(f"使用 lookback_days={lookback_days}，计算 start_date={start_date}")
+        else:
             start_date = db_start
-        if end_date is None:
-            end_date = db_end
 
     if symbols is None:
         symbols = get_nasdaq100_symbols()
