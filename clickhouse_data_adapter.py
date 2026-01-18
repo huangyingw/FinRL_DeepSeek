@@ -273,49 +273,10 @@ def load_training_data(
     return train_df, test_df
 
 
-def create_mock_data_for_testing() -> pd.DataFrame:
-    """创建模拟数据用于测试"""
-    dates = pd.date_range('2023-01-01', '2023-12-31', freq='D')
-    symbols = ['AAPL', 'MSFT', 'GOOGL']
-
-    data = []
-    for symbol in symbols:
-        base_price = 100 + np.random.randn() * 20
-        for date in dates:
-            price = base_price * (1 + np.random.randn() * 0.02)
-            data.append({
-                'tic': symbol,
-                'date': date.strftime('%Y-%m-%d'),
-                'open': price,
-                'high': price * 1.01,
-                'low': price * 0.99,
-                'close': price,
-                'volume': int(1000000 * (1 + np.random.rand())),
-                'macd': np.random.randn() * 0.5,
-                'boll_ub': price * 1.02,
-                'boll_lb': price * 0.98,
-                'rsi_30': 50 + np.random.randn() * 10,
-                'cci_30': np.random.randn() * 50,
-                'dx_30': 20 + np.random.rand() * 30,
-                'close_30_sma': price,
-                'close_60_sma': price,
-                'llm_sentiment': np.random.choice([1, 2, 3, 4, 5]),
-                'llm_risk': np.random.choice([1, 2, 3, 4, 5])
-            })
-
-    return pd.DataFrame(data)
-
-
 if __name__ == "__main__":
     logging.basicConfig(level=logging.INFO)
-    try:
-        train_df, test_df = load_training_data()
-        print(f"Train shape: {train_df.shape}")
-        print(f"Test shape: {test_df.shape}")
-        print(f"\nColumns: {train_df.columns.tolist()}")
-        print(f"\nSample:\n{train_df.head()}")
-    except Exception as e:
-        print(f"ClickHouse 连接失败: {e}")
-        print("使用模拟数据测试...")
-        mock_df = create_mock_data_for_testing()
-        print(f"Mock data shape: {mock_df.shape}")
+    train_df, test_df = load_training_data()
+    print(f"Train shape: {train_df.shape}")
+    print(f"Test shape: {test_df.shape}")
+    print(f"\nColumns: {train_df.columns.tolist()}")
+    print(f"\nSample:\n{train_df.head()}")
