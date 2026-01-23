@@ -9,9 +9,23 @@
 #   training.epochs: 训练轮数 (默认: 100)
 
 import os
+import sys
 import warnings
 warnings.filterwarnings('ignore')
 
+# 添加项目根目录到路径以导入 MessageBus
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__)))))
+
+# 消息总线支持（可选）
+MESSAGE_BUS = None
+CORRELATION_ID = None
+try:
+    from trading_strategies.message_bus import MessageBus, EventType
+    MESSAGE_BUS_ENABLED = os.environ.get('ENABLE_MESSAGE_BUS', 'false').lower() == 'true'
+except ImportError:
+    MESSAGE_BUS_ENABLED = False
+
+from datasets import load_dataset
 import pandas as pd
 from env_stocktrading_llm_risk import StockTradingEnv
 
@@ -48,6 +62,24 @@ from spinup.utils.mpi_pytorch import setup_pytorch_for_mpi, sync_params, mpi_avg
 from spinup.utils.mpi_tools import mpi_fork, mpi_avg, proc_id, mpi_statistics_scalar, num_procs
 
 import time
+import uuid
+from datetime import datetime
+
+
+def publish_event(event_type: str, **kwargs):
+    """发布事件到消息总线（如果启用）"""
+    global MESSAGE_BUS, CORRELATION_ID
+    if MESSAGE_BUS is None:
+        return
+    try:
+        MESSAGE_BUS.publish_training_event(
+            event_type,
+            correlation_id=CORRELATION_ID,
+            **kwargs
+        )
+    except Exception as e:
+        print(f"[MessageBus] Failed to publish {event_type}: {e}")
+
 
 # Force GPU usage
 if not torch.cuda.is_available():
@@ -528,6 +560,20 @@ def cppo(env_fn,
         print("nu:", nu)
         print("lam:", cvarlam)
         print("-" * 37, flush=True)
+
+        # 每 10 epochs 发布进度事件
+        if MESSAGE_BUS_ENABLED and (epoch + 1) % 10 == 0:
+            publish_event(
+                EventType.TRAINING_PROGRESS,
+                metrics={
+                    "epoch": epoch + 1,
+                    "total_epochs": epochs,
+                    "progress_pct": round((epoch + 1) / epochs * 100, 1),
+                    "elapsed_time": time.time() - start_time,
+                    "nu": float(nu),
+                    "lam": float(cvarlam)
+                }
+            )
     return ac
 
 
@@ -543,6 +589,19 @@ if __name__ == "__main__":
 
     args = parser.parse_args()
 
+    # 初始化消息总线（如果启用）
+    if MESSAGE_BUS_ENABLED:
+        try:
+            MESSAGE_BUS = MessageBus(
+                redis_url=os.environ.get('REDIS_URL', 'redis://redis:6379'),
+                service_name="finrl-deepseek-trainer"
+            )
+            CORRELATION_ID = f"train-{datetime.now().strftime('%Y%m%d-%H%M%S')}-{uuid.uuid4().hex[:6]}"
+            print(f"[MessageBus] Enabled, correlation_id={CORRELATION_ID}")
+        except Exception as e:
+            print(f"[MessageBus] Failed to initialize: {e}")
+            MESSAGE_BUS = None
+
     from spinup.utils.run_utils import setup_logger_kwargs
     logger_kwargs = setup_logger_kwargs(args.exp_name, args.seed)
 
@@ -552,10 +611,55 @@ if __name__ == "__main__":
     print(f"Starting CPPO-DeepSeek training with {epochs} epochs...")
     print(f"Hyperparameters loaded from config file")
 
-    trained_cppo = cppo(lambda: env_train, actor_critic=MLPActorCritic,
-                        seed=args.seed, logger_kwargs=logger_kwargs)
+    hyperparams = {
+        "epochs": epochs,
+        "seed": args.seed,
+        "exp_name": args.exp_name
+    }
 
-    # Save the model
-    model_path = TRAINED_MODEL_DIR + f"/agent_cppo_deepseek_{epochs}_epochs.pth"
-    torch.save(trained_cppo.state_dict(), model_path)
-    print("Training finished and saved in " + model_path)
+    # 发布训练开始事件
+    if MESSAGE_BUS_ENABLED:
+        publish_event(
+            EventType.TRAINING_STARTED,
+            hyperparams=hyperparams
+        )
+
+    training_start_time = time.time()
+    model_path = None
+
+    try:
+        trained_cppo = cppo(lambda: env_train, actor_critic=MLPActorCritic,
+                            seed=args.seed, logger_kwargs=logger_kwargs)
+
+        # Save the model
+        model_path = TRAINED_MODEL_DIR + f"/agent_cppo_deepseek_{epochs}_epochs.pth"
+        torch.save(trained_cppo.state_dict(), model_path)
+        print("Training finished and saved in " + model_path)
+
+        # 发布训练完成事件
+        if MESSAGE_BUS_ENABLED:
+            training_duration = time.time() - training_start_time
+            publish_event(
+                EventType.TRAINING_COMPLETED,
+                model_path=model_path,
+                metrics={
+                    "epochs": epochs,
+                    "duration_seconds": round(training_duration, 2),
+                    "duration_minutes": round(training_duration / 60, 1)
+                },
+                hyperparams=hyperparams
+            )
+
+    except Exception as e:
+        # 发布训练失败事件
+        if MESSAGE_BUS_ENABLED:
+            publish_event(
+                EventType.TRAINING_FAILED,
+                error=str(e),
+                hyperparams=hyperparams
+            )
+        raise
+    finally:
+        # 关闭消息总线
+        if MESSAGE_BUS is not None:
+            MESSAGE_BUS.close()
