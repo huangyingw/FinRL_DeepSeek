@@ -3,10 +3,10 @@
 # Standalone training script for CPPO-DeepSeek
 # Run with: OMPI_ALLOW_RUN_AS_ROOT=1 OMPI_ALLOW_RUN_AS_ROOT_CONFIRM=1 mpirun -np 4 python3 train_cppo_llm_risk_standalone.py
 #
-# 环境变量:
-#   DATA_SOURCE: 'clickhouse' 或 'huggingface' (默认: huggingface)
-#   TRAIN_START_DATE: 训练开始日期 (默认: 2018-01-01)
-#   TRAIN_END_DATE: 训练结束日期 (默认: 2023-12-31)
+# 配置来源: config/settings.yaml (Docker 挂载)
+#   training.data_source: 'clickhouse' 或 'huggingface' (默认: clickhouse)
+#   training.lookback_days: 训练数据回溯天数 (默认: 1825，约5年)
+#   training.epochs: 训练轮数 (默认: 100)
 
 import os
 import warnings
@@ -28,7 +28,8 @@ INDICATORS = [
 ]
 
 # Stateless: 模型保存到 Docker named volume
-TRAINED_MODEL_DIR = os.path.join(os.environ.get('MODELS_DIR', '/app/models'), 'finrl_deepseek', 'trained_models')
+from config_loader import get_models_dir, get_training_config
+TRAINED_MODEL_DIR = os.path.join(get_models_dir(), 'finrl_deepseek', 'trained_models')
 os.makedirs(TRAINED_MODEL_DIR, exist_ok=True)
 print(f"Model directory: {TRAINED_MODEL_DIR}")
 
@@ -57,17 +58,17 @@ print(f"GPU: {torch.cuda.get_device_name(0)}")
 
 
 def load_data():
-    """根据 DATA_SOURCE 环境变量加载训练数据"""
-    data_source = os.environ.get('DATA_SOURCE', 'huggingface').lower()
+    """根据配置文件加载训练数据"""
+    training_config = get_training_config()
+    data_source = training_config['data_source'].lower()
 
     if data_source == 'clickhouse':
         print("Loading training data from ClickHouse...")
         try:
             from clickhouse_data_adapter import load_training_data
-            start_date = os.environ.get('TRAIN_START_DATE', '2018-01-01')
-            end_date = os.environ.get('TRAIN_END_DATE', '2023-12-31')
-            train, _ = load_training_data(start_date=start_date, end_date=end_date, test_ratio=0.0)
-            print(f"Loaded {len(train)} rows from ClickHouse ({start_date} to {end_date})")
+            lookback_days = training_config['lookback_days']
+            train, _ = load_training_data(lookback_days=lookback_days, test_ratio=0.0)
+            print(f"Loaded {len(train)} rows from ClickHouse (lookback_days={lookback_days})")
         except Exception as e:
             print(f"ClickHouse 加载失败: {e}")
             print("回退到 Hugging Face 数据...")
@@ -110,7 +111,7 @@ def load_best_params():
     """从 Optuna 优化结果自动加载最佳超参数"""
     import json
     best_params_path = os.path.join(
-        os.environ.get('MODELS_DIR', '/app/models'),
+        get_models_dir(),
         'optuna_results', 'best_params.json'
     )
     if os.path.exists(best_params_path):
@@ -545,10 +546,11 @@ if __name__ == "__main__":
     from spinup.utils.run_utils import setup_logger_kwargs
     logger_kwargs = setup_logger_kwargs(args.exp_name, args.seed)
 
-    # 从环境变量读取超参数（由 cppo 函数内部处理）
-    epochs = int(os.environ.get('EPOCHS', 100))
+    # 从配置文件读取超参数
+    training_config = get_training_config()
+    epochs = training_config['epochs']
     print(f"Starting CPPO-DeepSeek training with {epochs} epochs...")
-    print(f"Hyperparameters loaded from environment variables")
+    print(f"Hyperparameters loaded from config file")
 
     trained_cppo = cppo(lambda: env_train, actor_critic=MLPActorCritic,
                         seed=args.seed, logger_kwargs=logger_kwargs)

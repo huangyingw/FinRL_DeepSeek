@@ -28,26 +28,27 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
-# 模型和结果保存目录
-MODELS_DIR = os.environ.get('MODELS_DIR', '/app/models')
+# 模型和结果保存目录 - 从配置文件读取
+from config_loader import get_models_dir, get_training_config
+MODELS_DIR = get_models_dir()
 RESULTS_DIR = os.path.join(MODELS_DIR, 'optuna_results')
 os.makedirs(RESULTS_DIR, exist_ok=True)
 
 
 def load_data():
     """加载训练和验证数据"""
-    data_source = os.environ.get('DATA_SOURCE', 'huggingface').lower()
+    training_config = get_training_config()
+    data_source = training_config['data_source'].lower()
 
     if data_source == 'clickhouse':
         logger.info("从 ClickHouse 加载数据...")
         try:
             from clickhouse_data_adapter import load_training_data
-            start_date = os.environ.get('TRAIN_START_DATE', '2018-01-01')
-            end_date = os.environ.get('TRAIN_END_DATE', '2023-12-31')
+            lookback_days = training_config['lookback_days']
+            test_ratio = training_config['test_ratio']
             train_df, val_df = load_training_data(
-                start_date=start_date,
-                end_date=end_date,
-                test_ratio=0.2
+                lookback_days=lookback_days,
+                test_ratio=test_ratio
             )
             logger.info(f"ClickHouse 数据: 训练 {len(train_df)} 行, 验证 {len(val_df)} 行")
             return train_df, val_df

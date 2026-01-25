@@ -42,8 +42,9 @@ from spinup.utils.logx import EpochLogger
 from spinup.utils.mpi_pytorch import setup_pytorch_for_mpi, sync_params, mpi_avg_grads
 from spinup.utils.mpi_tools import mpi_fork, mpi_avg, proc_id, mpi_statistics_scalar, num_procs
 
-# Stateless: 模型保存到 Docker named volume
-SHARED_MODEL_DIR = os.path.join(os.environ.get('MODELS_DIR', '/app/models'), 'finrl_deepseek')
+# Stateless: 模型保存到 Docker named volume - 从配置文件读取
+from config_loader import get_models_dir
+SHARED_MODEL_DIR = os.path.join(get_models_dir(), 'finrl_deepseek')
 os.makedirs(SHARED_MODEL_DIR, exist_ok=True)
 
 # Indicators
