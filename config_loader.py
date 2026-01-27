@@ -3,66 +3,30 @@
 """
 Configuration Loader for FinRL-DeepSeek
 
-从挂载的配置文件读取配置，遵循统一配置管理设计：
-- 非敏感配置: 从 config/settings.yaml 读取
-- 敏感数据: 通过 pkg.database 封装层获取（内部使用 Doppler）
+统一从 EnvManager 获取配置，遵循统一配置管理设计：
+- 非敏感配置: EnvManager → config/settings.yaml
+- 敏感数据: EnvManager → Doppler SDK
 """
 
 import os
-from pathlib import Path
-from typing import Any, Dict, Optional
+import sys
+from typing import Any, Dict
 
-import yaml
+# 添加父项目路径，复用 utils.env_manager
+PROJECT_ROOT = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+sys.path.insert(0, PROJECT_ROOT)
 
-
-# 配置文件路径优先级
-CONFIG_PATHS = [
-    '/app/config/settings.yaml',           # Docker 挂载路径
-    Path(__file__).parent.parent.parent / 'config' / 'settings.yaml',  # 开发环境相对路径
-]
-
-_config_cache: Optional[Dict[str, Any]] = None
-
-
-def _load_config() -> Dict[str, Any]:
-    """加载配置文件"""
-    global _config_cache
-    if _config_cache is not None:
-        return _config_cache
-
-    for path in CONFIG_PATHS:
-        path = Path(path)
-        if path.exists():
-            with open(path, 'r', encoding='utf-8') as f:
-                _config_cache = yaml.safe_load(f) or {}
-                return _config_cache
-
-    # 配置文件不存在，使用空配置（依赖默认值）
-    _config_cache = {}
-    return _config_cache
+from utils.env_manager import EnvManager
 
 
 def get_paths_config() -> Dict[str, str]:
-    """获取路径配置"""
-    config = _load_config()
-    paths = config.get('paths', {})
-    return {
-        'models_dir': paths.get('models_dir', '/app/models'),
-        'results_dir': paths.get('results_dir', '/app/results'),
-        'data_dir': paths.get('data_dir', '/app/data'),
-    }
+    """获取路径配置 - 通过 EnvManager"""
+    return EnvManager.paths_config()
 
 
 def get_training_config() -> Dict[str, Any]:
-    """获取训练配置"""
-    config = _load_config()
-    training = config.get('training', {})
-    return {
-        'data_source': training.get('data_source', 'clickhouse'),
-        'lookback_days': training.get('lookback_days', 1825),
-        'epochs': training.get('epochs', 100),
-        'test_ratio': training.get('test_ratio', 0.2),
-    }
+    """获取训练配置 - 通过 EnvManager"""
+    return EnvManager.training_config()
 
 
 def get_models_dir() -> str:
