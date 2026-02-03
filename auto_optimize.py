@@ -51,6 +51,8 @@ def load_data():
                 test_ratio=test_ratio
             )
             logger.info(f"ClickHouse 数据: 训练 {len(train_df)} 行, 验证 {len(val_df)} 行")
+            if len(train_df) > 0:
+                logger.info(f"日期范围: {train_df['date'].min()} ~ {val_df['date'].max() if len(val_df) > 0 else train_df['date'].max()}")
             return train_df, val_df
         except Exception as e:
             logger.warning(f"ClickHouse 加载失败: {e}, 回退到 Hugging Face")

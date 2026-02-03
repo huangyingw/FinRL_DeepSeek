@@ -100,7 +100,9 @@ def load_data():
             from clickhouse_data_adapter import load_training_data
             lookback_days = training_config['lookback_days']
             train, _ = load_training_data(lookback_days=lookback_days, test_ratio=0.0)
-            print(f"Loaded {len(train)} rows from ClickHouse (lookback_days={lookback_days})")
+            actual_start = train['date'].min()
+            actual_end = train['date'].max()
+            print(f"Loaded {len(train)} rows from ClickHouse ({actual_start} to {actual_end}, lookback_days={lookback_days})")
         except Exception as e:
             print(f"ClickHouse 加载失败: {e}")
             print("回退到 Hugging Face 数据...")
