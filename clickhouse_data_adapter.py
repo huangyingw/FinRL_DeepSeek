@@ -320,18 +320,32 @@ def load_training_data(
         'llm_risk': 3,  # 中性风险
         'macd': 0, 'boll_ub': 0, 'boll_lb': 0,
         'rsi_30': 50, 'cci_30': 0, 'dx_30': 0,
-        'close_30_sma': 0, 'close_60_sma': 0
+        'close_30_sma': 0, 'close_60_sma': 0,
+        'avg_sentiment': 0, 'news_count': 0,
+        'return': 0, 'volatility': 0
     })
 
     # 6. 删除包含 NaN 的行（主要是初始窗口期）
     df = df.dropna()
 
     # 7. 确保每日股票数量一致（FinRL 环境要求）
+    # 第一步：按覆盖率筛选股票（剔除数据严重不足的股票）
+    total_dates = df['date'].nunique()
+    tic_date_counts = df.groupby('tic')['date'].count()
+    min_coverage = 0.8  # 至少覆盖 80% 的交易日
+    well_covered_tics = tic_date_counts[tic_date_counts >= total_dates * min_coverage].index.tolist()
+    dropped_tics = set(df['tic'].unique()) - set(well_covered_tics)
+    if dropped_tics:
+        logger.info(f"剔除数据覆盖不足的股票 ({len(dropped_tics)} 只): {sorted(dropped_tics)}")
+    df = df[df['tic'].isin(well_covered_tics)]
+
+    # 第二步：保留所有股票都有数据的日期
+    n_stocks = df['tic'].nunique()
     date_counts = df.groupby('date')['tic'].count()
-    valid_dates = date_counts[date_counts == date_counts.max()].index.tolist()
+    valid_dates = date_counts[date_counts == n_stocks].index.tolist()
     df = df[df['date'].isin(valid_dates)]
 
-    # 只保留所有日期都有数据的股票
+    # 第三步：最终验证 - 确保所有股票在所有日期都有数据
     n_dates = df['date'].nunique()
     tic_counts = df.groupby('tic')['date'].count()
     valid_tics = tic_counts[tic_counts == n_dates].index.tolist()

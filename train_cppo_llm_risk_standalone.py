@@ -102,6 +102,15 @@ stock_dimension = len(train.tic.unique())
 state_space = 1 + 2*stock_dimension + (2+len(INDICATORS))*stock_dimension
 print(f"Stock Dimension: {stock_dimension}, State Space: {state_space}")
 
+# 保存参考股票列表（供 backtester 使用）
+import json as _json
+_ref_stocks_path = os.path.join(os.environ.get('MODELS_DIR', '/app/models'), 'reference_stocks.json')
+_ref_stocks = sorted(train['tic'].unique().tolist())
+with open(_ref_stocks_path, 'w') as _f:
+    _json.dump({'stocks': _ref_stocks, 'count': len(_ref_stocks),
+                'data_source': os.environ.get('DATA_SOURCE', 'huggingface')}, _f, indent=2)
+print(f"Saved reference stocks ({len(_ref_stocks)}) to {_ref_stocks_path}")
+
 buy_cost_list = sell_cost_list = [0.001] * stock_dimension
 num_stock_shares = [0] * stock_dimension
 
