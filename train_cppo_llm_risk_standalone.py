@@ -3,15 +3,29 @@
 # Standalone training script for CPPO-DeepSeek
 # Run with: OMPI_ALLOW_RUN_AS_ROOT=1 OMPI_ALLOW_RUN_AS_ROOT_CONFIRM=1 mpirun -np 4 python3 train_cppo_llm_risk_standalone.py
 #
-# 环境变量:
-#   DATA_SOURCE: 'clickhouse' 或 'huggingface' (默认: huggingface)
-#   TRAIN_START_DATE: 训练开始日期 (默认: 2018-01-01)
-#   TRAIN_END_DATE: 训练结束日期 (默认: 2023-12-31)
+# 配置来源: config/settings.yaml (Docker 挂载)
+#   training.data_source: 'clickhouse' 或 'huggingface' (默认: clickhouse)
+#   training.lookback_days: 训练数据回溯天数 (默认: 1825，约5年)
+#   training.epochs: 训练轮数 (默认: 100)
 
 import os
+import sys
 import warnings
 warnings.filterwarnings('ignore')
 
+# 添加项目根目录到路径以导入 MessageBus
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__)))))
+
+# 消息总线支持（可选）
+MESSAGE_BUS = None
+CORRELATION_ID = None
+try:
+    from trading_strategies.message_bus import MessageBus, EventType
+    MESSAGE_BUS_ENABLED = os.environ.get('ENABLE_MESSAGE_BUS', 'false').lower() == 'true'
+except ImportError:
+    MESSAGE_BUS_ENABLED = False
+
+from datasets import load_dataset
 import pandas as pd
 from env_stocktrading_llm_risk import StockTradingEnv
 
@@ -28,7 +42,8 @@ INDICATORS = [
 ]
 
 # Stateless: 模型保存到 Docker named volume
-TRAINED_MODEL_DIR = os.path.join(os.environ.get('MODELS_DIR', '/app/models'), 'finrl_deepseek', 'trained_models')
+from config_loader import get_models_dir, get_training_config
+TRAINED_MODEL_DIR = os.path.join(get_models_dir(), 'finrl_deepseek', 'trained_models')
 os.makedirs(TRAINED_MODEL_DIR, exist_ok=True)
 print(f"Model directory: {TRAINED_MODEL_DIR}")
 
@@ -47,6 +62,24 @@ from spinup.utils.mpi_pytorch import setup_pytorch_for_mpi, sync_params, mpi_avg
 from spinup.utils.mpi_tools import mpi_fork, mpi_avg, proc_id, mpi_statistics_scalar, num_procs
 
 import time
+import uuid
+from datetime import datetime
+
+
+def publish_event(event_type: str, **kwargs):
+    """发布事件到消息总线（如果启用）"""
+    global MESSAGE_BUS, CORRELATION_ID
+    if MESSAGE_BUS is None:
+        return
+    try:
+        MESSAGE_BUS.publish_training_event(
+            event_type,
+            correlation_id=CORRELATION_ID,
+            **kwargs
+        )
+    except Exception as e:
+        print(f"[MessageBus] Failed to publish {event_type}: {e}")
+
 
 # Force GPU usage
 if not torch.cuda.is_available():
@@ -57,17 +90,19 @@ print(f"GPU: {torch.cuda.get_device_name(0)}")
 
 
 def load_data():
-    """根据 DATA_SOURCE 环境变量加载训练数据"""
-    data_source = os.environ.get('DATA_SOURCE', 'huggingface').lower()
+    """根据配置文件加载训练数据"""
+    training_config = get_training_config()
+    data_source = training_config['data_source'].lower()
 
     if data_source == 'clickhouse':
         print("Loading training data from ClickHouse...")
         try:
             from clickhouse_data_adapter import load_training_data
-            start_date = os.environ.get('TRAIN_START_DATE', '2018-01-01')
-            end_date = os.environ.get('TRAIN_END_DATE', '2023-12-31')
-            train, _ = load_training_data(start_date=start_date, end_date=end_date, test_ratio=0.0)
-            print(f"Loaded {len(train)} rows from ClickHouse ({start_date} to {end_date})")
+            lookback_days = training_config['lookback_days']
+            train, _ = load_training_data(lookback_days=lookback_days, test_ratio=0.0)
+            actual_start = train['date'].min()
+            actual_end = train['date'].max()
+            print(f"Loaded {len(train)} rows from ClickHouse ({actual_start} to {actual_end}, lookback_days={lookback_days})")
         except Exception as e:
             print(f"ClickHouse 加载失败: {e}")
             print("回退到 Hugging Face 数据...")
@@ -119,7 +154,7 @@ def load_best_params():
     """从 Optuna 优化结果自动加载最佳超参数"""
     import json
     best_params_path = os.path.join(
-        os.environ.get('MODELS_DIR', '/app/models'),
+        get_models_dir(),
         'optuna_results', 'best_params.json'
     )
     if os.path.exists(best_params_path):
@@ -536,6 +571,20 @@ def cppo(env_fn,
         print("nu:", nu)
         print("lam:", cvarlam)
         print("-" * 37, flush=True)
+
+        # 每 10 epochs 发布进度事件
+        if MESSAGE_BUS_ENABLED and (epoch + 1) % 10 == 0:
+            publish_event(
+                EventType.TRAINING_PROGRESS,
+                metrics={
+                    "epoch": epoch + 1,
+                    "total_epochs": epochs,
+                    "progress_pct": round((epoch + 1) / epochs * 100, 1),
+                    "elapsed_time": time.time() - start_time,
+                    "nu": float(nu),
+                    "lam": float(cvarlam)
+                }
+            )
     return ac
 
 
@@ -551,18 +600,77 @@ if __name__ == "__main__":
 
     args = parser.parse_args()
 
+    # 初始化消息总线（如果启用）
+    if MESSAGE_BUS_ENABLED:
+        try:
+            MESSAGE_BUS = MessageBus(
+                redis_url=os.environ.get('REDIS_URL', 'redis://redis:6379'),
+                service_name="finrl-deepseek-trainer"
+            )
+            CORRELATION_ID = f"train-{datetime.now().strftime('%Y%m%d-%H%M%S')}-{uuid.uuid4().hex[:6]}"
+            print(f"[MessageBus] Enabled, correlation_id={CORRELATION_ID}")
+        except Exception as e:
+            print(f"[MessageBus] Failed to initialize: {e}")
+            MESSAGE_BUS = None
+
     from spinup.utils.run_utils import setup_logger_kwargs
     logger_kwargs = setup_logger_kwargs(args.exp_name, args.seed)
 
-    # 从环境变量读取超参数（由 cppo 函数内部处理）
-    epochs = int(os.environ.get('EPOCHS', 100))
+    # 从配置文件读取超参数
+    training_config = get_training_config()
+    epochs = training_config['epochs']
     print(f"Starting CPPO-DeepSeek training with {epochs} epochs...")
-    print(f"Hyperparameters loaded from environment variables")
+    print(f"Hyperparameters loaded from config file")
 
-    trained_cppo = cppo(lambda: env_train, actor_critic=MLPActorCritic,
-                        seed=args.seed, logger_kwargs=logger_kwargs)
+    hyperparams = {
+        "epochs": epochs,
+        "seed": args.seed,
+        "exp_name": args.exp_name
+    }
 
-    # Save the model
-    model_path = TRAINED_MODEL_DIR + f"/agent_cppo_deepseek_{epochs}_epochs.pth"
-    torch.save(trained_cppo.state_dict(), model_path)
-    print("Training finished and saved in " + model_path)
+    # 发布训练开始事件
+    if MESSAGE_BUS_ENABLED:
+        publish_event(
+            EventType.TRAINING_STARTED,
+            hyperparams=hyperparams
+        )
+
+    training_start_time = time.time()
+    model_path = None
+
+    try:
+        trained_cppo = cppo(lambda: env_train, actor_critic=MLPActorCritic,
+                            seed=args.seed, logger_kwargs=logger_kwargs)
+
+        # Save the model
+        model_path = TRAINED_MODEL_DIR + f"/agent_cppo_deepseek_{epochs}_epochs.pth"
+        torch.save(trained_cppo.state_dict(), model_path)
+        print("Training finished and saved in " + model_path)
+
+        # 发布训练完成事件
+        if MESSAGE_BUS_ENABLED:
+            training_duration = time.time() - training_start_time
+            publish_event(
+                EventType.TRAINING_COMPLETED,
+                model_path=model_path,
+                metrics={
+                    "epochs": epochs,
+                    "duration_seconds": round(training_duration, 2),
+                    "duration_minutes": round(training_duration / 60, 1)
+                },
+                hyperparams=hyperparams
+            )
+
+    except Exception as e:
+        # 发布训练失败事件
+        if MESSAGE_BUS_ENABLED:
+            publish_event(
+                EventType.TRAINING_FAILED,
+                error=str(e),
+                hyperparams=hyperparams
+            )
+        raise
+    finally:
+        # 关闭消息总线
+        if MESSAGE_BUS is not None:
+            MESSAGE_BUS.close()
