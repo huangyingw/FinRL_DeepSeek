@@ -3,15 +3,21 @@
 # Standalone training script for CPPO-DeepSeek
 # Run with: OMPI_ALLOW_RUN_AS_ROOT=1 OMPI_ALLOW_RUN_AS_ROOT_CONFIRM=1 mpirun -np 4 python3 train_cppo_llm_risk_standalone.py
 #
-# 环境变量:
-#   DATA_SOURCE: 'clickhouse' 或 'huggingface' (默认: huggingface)
-#   TRAIN_START_DATE: 训练开始日期 (默认: 2018-01-01)
-#   TRAIN_END_DATE: 训练结束日期 (默认: 2023-12-31)
+# 配置来源: config/settings.yaml (Docker 挂载)
+#   training.data_source: 'clickhouse' 或 'huggingface' (默认: clickhouse)
+#   training.lookback_days: 训练数据回溯天数 (默认: 1825，约5年)
+#   training.epochs: 训练轮数 (默认: 100)
 
 import os
+import sys
 import warnings
 warnings.filterwarnings('ignore')
 
+# 添加项目根目录到路径（用于导入 config_loader, backtest 等）
+PROJECT_ROOT = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+sys.path.insert(0, PROJECT_ROOT)
+
+from datasets import load_dataset
 import pandas as pd
 from env_stocktrading_llm_risk import StockTradingEnv
 
@@ -28,7 +34,8 @@ INDICATORS = [
 ]
 
 # Stateless: 模型保存到 Docker named volume
-TRAINED_MODEL_DIR = os.path.join(os.environ.get('MODELS_DIR', '/app/models'), 'finrl_deepseek', 'trained_models')
+from config_loader import get_models_dir, get_training_config
+TRAINED_MODEL_DIR = os.path.join(get_models_dir(), 'finrl_deepseek', 'trained_models')
 os.makedirs(TRAINED_MODEL_DIR, exist_ok=True)
 print(f"Model directory: {TRAINED_MODEL_DIR}")
 
@@ -48,6 +55,7 @@ from spinup.utils.mpi_tools import mpi_fork, mpi_avg, proc_id, mpi_statistics_sc
 
 import time
 
+
 # Force GPU usage
 if not torch.cuda.is_available():
     raise RuntimeError("CUDA is not available. This training requires GPU.")
@@ -57,17 +65,19 @@ print(f"GPU: {torch.cuda.get_device_name(0)}")
 
 
 def load_data():
-    """根据 DATA_SOURCE 环境变量加载训练数据"""
-    data_source = os.environ.get('DATA_SOURCE', 'huggingface').lower()
+    """根据配置文件加载训练数据"""
+    training_config = get_training_config()
+    data_source = training_config['data_source'].lower()
 
     if data_source == 'clickhouse':
         print("Loading training data from ClickHouse...")
         try:
             from clickhouse_data_adapter import load_training_data
-            start_date = os.environ.get('TRAIN_START_DATE', '2018-01-01')
-            end_date = os.environ.get('TRAIN_END_DATE', '2023-12-31')
-            train, _ = load_training_data(start_date=start_date, end_date=end_date, test_ratio=0.0)
-            print(f"Loaded {len(train)} rows from ClickHouse ({start_date} to {end_date})")
+            lookback_days = training_config['lookback_days']
+            train, _ = load_training_data(lookback_days=lookback_days, test_ratio=0.0)
+            actual_start = train['date'].min()
+            actual_end = train['date'].max()
+            print(f"Loaded {len(train)} rows from ClickHouse ({actual_start} to {actual_end}, lookback_days={lookback_days})")
         except Exception as e:
             print(f"ClickHouse 加载失败: {e}")
             print("回退到 Hugging Face 数据...")
@@ -102,6 +112,15 @@ stock_dimension = len(train.tic.unique())
 state_space = 1 + 2*stock_dimension + (2+len(INDICATORS))*stock_dimension
 print(f"Stock Dimension: {stock_dimension}, State Space: {state_space}")
 
+# 保存参考股票列表（供 backtester 使用）
+import json as _json
+_ref_stocks_path = os.path.join(os.environ.get('MODELS_DIR', '/app/models'), 'reference_stocks.json')
+_ref_stocks = sorted(train['tic'].unique().tolist())
+with open(_ref_stocks_path, 'w') as _f:
+    _json.dump({'stocks': _ref_stocks, 'count': len(_ref_stocks),
+                'data_source': os.environ.get('DATA_SOURCE', 'huggingface')}, _f, indent=2)
+print(f"Saved reference stocks ({len(_ref_stocks)}) to {_ref_stocks_path}")
+
 buy_cost_list = sell_cost_list = [0.001] * stock_dimension
 num_stock_shares = [0] * stock_dimension
 
@@ -110,7 +129,7 @@ def load_best_params():
     """从 Optuna 优化结果自动加载最佳超参数"""
     import json
     best_params_path = os.path.join(
-        os.environ.get('MODELS_DIR', '/app/models'),
+        get_models_dir(),
         'optuna_results', 'best_params.json'
     )
     if os.path.exists(best_params_path):
@@ -527,6 +546,7 @@ def cppo(env_fn,
         print("nu:", nu)
         print("lam:", cvarlam)
         print("-" * 37, flush=True)
+
     return ac
 
 
@@ -545,10 +565,13 @@ if __name__ == "__main__":
     from spinup.utils.run_utils import setup_logger_kwargs
     logger_kwargs = setup_logger_kwargs(args.exp_name, args.seed)
 
-    # 从环境变量读取超参数（由 cppo 函数内部处理）
-    epochs = int(os.environ.get('EPOCHS', 100))
+    # 从配置文件读取超参数
+    training_config = get_training_config()
+    epochs = training_config['epochs']
     print(f"Starting CPPO-DeepSeek training with {epochs} epochs...")
-    print(f"Hyperparameters loaded from environment variables")
+    print(f"Hyperparameters loaded from config file")
+
+    training_start_time = time.time()
 
     trained_cppo = cppo(lambda: env_train, actor_critic=MLPActorCritic,
                         seed=args.seed, logger_kwargs=logger_kwargs)
@@ -556,48 +579,20 @@ if __name__ == "__main__":
     # Save the model
     model_path = TRAINED_MODEL_DIR + f"/agent_cppo_deepseek_{epochs}_epochs.pth"
     torch.save(trained_cppo.state_dict(), model_path)
-    print("Training finished and saved in " + model_path)
+    training_duration = time.time() - training_start_time
+    print(f"Training finished in {training_duration/60:.1f} minutes, saved to {model_path}")
 
-    # 训练完成后直接回测（简单设计，无需消息队列）
+    # 训练完成后自动回测（同一容器内直接调用，无需消息队列）
     print("\n" + "=" * 60)
-    print("训练完成，开始回测...")
+    print("训练完成，开始自动回测...")
     print("=" * 60)
-
     try:
-        # 添加项目根目录到路径
-        import sys
-        from pathlib import Path
-        project_root = Path(__file__).parent.parent.parent
-        sys.path.insert(0, str(project_root))
-
-        from backtest_finrl_deepseek import (
-            load_trained_model,
-            load_test_data,
-            run_backtest,
-            calculate_metrics,
-            print_results
+        import subprocess
+        backtest_script = os.path.join(PROJECT_ROOT, "backtest_finrl_deepseek.py")
+        subprocess.run(
+            [sys.executable, backtest_script, "--model", model_path],
+            check=True
         )
-
-        # 加载刚训练的模型
-        model_state_dict, device = load_trained_model(model_path)
-        print(f"模型加载成功: {device}")
-
-        # 加载测试数据
-        test_data = load_test_data()
-        print(f"测试数据: {len(test_data)} 行")
-
-        # 运行回测
-        initial_amount = 1000000
-        portfolio_values, actions, env = run_backtest(
-            model_state_dict, test_data, device, initial_amount
-        )
-
-        # 计算并打印结果
-        metrics = calculate_metrics(portfolio_values, initial_amount)
-        print_results(metrics)
-
-        print("\n训练和回测全部完成!")
-
     except Exception as e:
-        print(f"\n回测失败: {e}")
-        print("训练已完成，模型已保存。可以稍后手动运行回测。")
+        print(f"⚠️ 自动回测失败: {e}")
+        print(f"可手动运行: python backtest_finrl_deepseek.py --model {model_path}")
