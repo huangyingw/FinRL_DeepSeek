@@ -557,3 +557,47 @@ if __name__ == "__main__":
     model_path = TRAINED_MODEL_DIR + f"/agent_cppo_deepseek_{epochs}_epochs.pth"
     torch.save(trained_cppo.state_dict(), model_path)
     print("Training finished and saved in " + model_path)
+
+    # 训练完成后直接回测（简单设计，无需消息队列）
+    print("\n" + "=" * 60)
+    print("训练完成，开始回测...")
+    print("=" * 60)
+
+    try:
+        # 添加项目根目录到路径
+        import sys
+        from pathlib import Path
+        project_root = Path(__file__).parent.parent.parent
+        sys.path.insert(0, str(project_root))
+
+        from backtest_finrl_deepseek import (
+            load_trained_model,
+            load_test_data,
+            run_backtest,
+            calculate_metrics,
+            print_results
+        )
+
+        # 加载刚训练的模型
+        model_state_dict, device = load_trained_model(model_path)
+        print(f"模型加载成功: {device}")
+
+        # 加载测试数据
+        test_data = load_test_data()
+        print(f"测试数据: {len(test_data)} 行")
+
+        # 运行回测
+        initial_amount = 1000000
+        portfolio_values, actions, env = run_backtest(
+            model_state_dict, test_data, device, initial_amount
+        )
+
+        # 计算并打印结果
+        metrics = calculate_metrics(portfolio_values, initial_amount)
+        print_results(metrics)
+
+        print("\n训练和回测全部完成!")
+
+    except Exception as e:
+        print(f"\n回测失败: {e}")
+        print("训练已完成，模型已保存。可以稍后手动运行回测。")
