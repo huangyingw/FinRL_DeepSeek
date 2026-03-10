@@ -46,10 +46,17 @@ def load_data():
             from clickhouse_data_adapter import load_training_data
             lookback_days = training_config['lookback_days']
             test_ratio = training_config['test_ratio']
-            train_df, val_df = load_training_data(
-                lookback_days=lookback_days,
-                test_ratio=test_ratio
-            )
+            # 优先使用环境变量指定的日期范围
+            start_date = os.environ.get('TRAIN_START_DATE')
+            end_date = os.environ.get('TRAIN_END_DATE')
+            if start_date and end_date:
+                train_df, val_df = load_training_data(
+                    start_date=start_date, end_date=end_date,
+                    test_ratio=test_ratio)
+            else:
+                train_df, val_df = load_training_data(
+                    lookback_days=lookback_days,
+                    test_ratio=test_ratio)
             logger.info(f"ClickHouse 数据: 训练 {len(train_df)} 行, 验证 {len(val_df)} 行")
             if len(train_df) > 0:
                 logger.info(f"日期范围: {train_df['date'].min()} ~ {val_df['date'].max() if len(val_df) > 0 else train_df['date'].max()}")
@@ -133,7 +140,9 @@ def train_and_evaluate(
     initial_amount: int,
     reward_scaling: float,
     hidden_sizes: tuple,
-    trial_name: str
+    trial_name: str,
+    ent_coef: float = 0.01,
+    weight_decay: float = 1e-5,
 ) -> float:
     """训练模型并返回验证集收益率"""
     import warnings
@@ -194,8 +203,8 @@ def train_and_evaluate(
     actor = GaussianActor(obs_dim, act_dim, hidden_sizes).to(DEVICE)
     critic = Critic(obs_dim, hidden_sizes).to(DEVICE)
 
-    pi_optimizer = torch.optim.Adam(actor.parameters(), lr=pi_lr)
-    vf_optimizer = torch.optim.Adam(critic.parameters(), lr=vf_lr)
+    pi_optimizer = torch.optim.Adam(actor.parameters(), lr=pi_lr, weight_decay=weight_decay)
+    vf_optimizer = torch.optim.Adam(critic.parameters(), lr=vf_lr, weight_decay=weight_decay)
 
     # 训练循环
     for epoch in range(epochs):
@@ -253,22 +262,29 @@ def train_and_evaluate(
             clip_adv = torch.clamp(ratio, 1-clip_ratio, 1+clip_ratio) * adv_tensor
             loss_pi = -(torch.min(ratio * adv_tensor, clip_adv)).mean()
 
+            # Entropy bonus：鼓励策略保持探索性
+            ent = dist.entropy().mean()
+            loss_pi = loss_pi - ent_coef * ent
+
             pi_optimizer.zero_grad()
             loss_pi.backward()
+            torch.nn.utils.clip_grad_norm_(actor.parameters(), 0.5)
             pi_optimizer.step()
 
-            # KL divergence 检查
-            kl = (logp_old - logp).mean().item()
+            # Per-dimension KL：除以动作维度数，与 standalone trainer 一致
+            kl = (logp_old - logp).mean().item() / act_dim
             if kl > 1.5 * target_kl:
                 break
 
-        # Value 更新
+        # Value 更新（带 clipping 防止 loss 爆炸）
         for _ in range(train_v_iters):
             value_pred = critic(obs_tensor)
             loss_v = ((value_pred - ret_tensor)**2).mean()
+            loss_v = torch.clamp(loss_v, max=100.0)
 
             vf_optimizer.zero_grad()
             loss_v.backward()
+            torch.nn.utils.clip_grad_norm_(critic.parameters(), 0.5)
             vf_optimizer.step()
 
         if epoch % 10 == 0:
@@ -278,6 +294,7 @@ def train_and_evaluate(
     obs, _ = val_env.reset()
     done = False
     val_ret = 0
+    portfolio_values = [initial_amount]
 
     while not done:
         obs_tensor = torch.as_tensor(obs, dtype=torch.float32, device=DEVICE)
@@ -285,41 +302,60 @@ def train_and_evaluate(
         obs, reward, terminated, truncated, _ = val_env.step(action)
         done = terminated or truncated
         val_ret += reward
+        # 追踪每日资产用于计算 Sharpe 和最大回撤
+        s = val_env.state
+        sd = val_env.stock_dim
+        pv = s[0] + sum(s[1+i] * s[1+sd+i] for i in range(sd))
+        portfolio_values.append(pv)
 
-    # 计算收益率 (现金 + 持仓价值)
-    stock_dim = val_env.stock_dim
-    cash = val_env.state[0]
-    holdings = val_env.state[1:1+stock_dim]
-    prices = val_env.state[1+stock_dim:1+2*stock_dim]
-    holdings_value = sum(h * p for h, p in zip(holdings, prices))
-    final_value = cash + holdings_value
-    returns = (final_value - initial_amount) / initial_amount
+    # 计算收益率
+    final_value = portfolio_values[-1]
+    total_return = (final_value - initial_amount) / initial_amount
 
-    logger.info(f"Trial {trial_name}: Val Return = {returns*100:.2f}%")
+    # 计算 Sharpe 和最大回撤用于复合评分
+    import pandas as pd
+    pv_series = pd.Series(portfolio_values)
+    daily_returns = pv_series.pct_change().dropna()
 
-    return returns
+    if len(daily_returns) > 1 and daily_returns.std() > 0:
+        sharpe = daily_returns.mean() / daily_returns.std() * (252 ** 0.5)
+    else:
+        sharpe = 0.0
+
+    cummax = pv_series.cummax()
+    drawdown = ((pv_series - cummax) / cummax).min()
+    max_dd = abs(drawdown) if not pd.isna(drawdown) else 0.0
+
+    # 复合评分：收益 + 风险调整 - 回撤惩罚
+    score = 0.4 * sharpe + 0.4 * total_return - 0.2 * max_dd
+
+    logger.info(f"Trial {trial_name}: Return={total_return*100:.2f}%, Sharpe={sharpe:.3f}, MaxDD={max_dd*100:.1f}%, Score={score:.4f}")
+
+    return score
 
 
 def objective(trial: Trial, train_df: pd.DataFrame, val_df: pd.DataFrame) -> float:
     """Optuna 目标函数"""
-    # 超参数搜索空间（扩展范围以支持更大网络和更长训练）
+    # 超参数搜索空间（扩展范围，包含正则化参数）
     params = {
-        'epochs': trial.suggest_int('epochs', 50, 150),  # 扩展 epochs 范围
+        'epochs': trial.suggest_int('epochs', 30, 200),
         'gamma': trial.suggest_float('gamma', 0.95, 0.999),
-        'clip_ratio': trial.suggest_float('clip_ratio', 0.1, 0.8),  # 扩展 clip_ratio 范围
+        'clip_ratio': trial.suggest_float('clip_ratio', 0.1, 0.3),
         'pi_lr': trial.suggest_float('pi_lr', 1e-5, 1e-3, log=True),
         'vf_lr': trial.suggest_float('vf_lr', 1e-5, 1e-3, log=True),
-        'train_pi_iters': trial.suggest_int('train_pi_iters', 40, 120),
-        'train_v_iters': trial.suggest_int('train_v_iters', 40, 120),
+        'train_pi_iters': trial.suggest_int('train_pi_iters', 5, 80),
+        'train_v_iters': trial.suggest_int('train_v_iters', 5, 80),
         'lam': trial.suggest_float('lam', 0.9, 0.99),
-        'target_kl': trial.suggest_float('target_kl', 0.01, 0.4),  # 扩展 target_kl 范围
-        'hmax': trial.suggest_int('hmax', 50, 200),
+        'target_kl': trial.suggest_float('target_kl', 0.005, 0.1),
+        'hmax': trial.suggest_int('hmax', 50, 300),
         'initial_amount': 1000000,
-        'reward_scaling': trial.suggest_float('reward_scaling', 1e-5, 1e-3, log=True),
+        'reward_scaling': trial.suggest_float('reward_scaling', 1e-6, 1e-2, log=True),
         'hidden_sizes': (
-            trial.suggest_categorical('hidden_size_1', [64, 128, 256, 512]),  # 添加 512
-            trial.suggest_categorical('hidden_size_2', [64, 128, 256, 512]),  # 添加 512
+            trial.suggest_categorical('hidden_size_1', [64, 128, 256]),
+            trial.suggest_categorical('hidden_size_2', [64, 128, 256]),
         ),
+        'ent_coef': trial.suggest_float('ent_coef', 0.0, 0.05),
+        'weight_decay': trial.suggest_float('weight_decay', 1e-6, 1e-3, log=True),
         'trial_name': f"trial_{trial.number}"
     }
 

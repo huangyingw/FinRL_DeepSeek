@@ -301,7 +301,7 @@ class StockTradingEnv(gym.Env):
             # logger.record("environment/total_cost", self.cost)
             # logger.record("environment/total_trades", self.trades)
 
-            return self.state, self.reward, self.terminal, False, {}
+            return self._normalize_state(self.state), self.reward, self.terminal, False, {}
 
         else:
             # Apply LLM sentiment to influence actions
@@ -389,7 +389,7 @@ class StockTradingEnv(gym.Env):
                 self.state
             )  # add current state in state_recorder for each step
 
-        return self.state, self.reward, self.terminal, False, {}
+        return self._normalize_state(self.state), self.reward, self.terminal, False, {}
 
     def reset(
         self,
@@ -430,7 +430,7 @@ class StockTradingEnv(gym.Env):
 
         self.episode += 1
 
-        return self.state, {}
+        return self._normalize_state(self.state), {}
 
     def render(self, mode="human", close=False):
         return self.state
@@ -477,6 +477,8 @@ class StockTradingEnv(gym.Env):
                         ),
                         [],
                     )
+                    + self.data[self.llm_sentiment_col].values.tolist()
+                    + self.data[self.llm_risk_col].values.tolist()
                 )
             else:
                 # for single stock
@@ -487,9 +489,57 @@ class StockTradingEnv(gym.Env):
                         (self.stock_dim + 1) : (self.stock_dim * 2 + 1)
                     ]
                     + sum(([self.data[tech]] for tech in self.tech_indicator_list), [])
+                    + [self.data[self.llm_sentiment_col]]
+                    + [self.data[self.llm_risk_col]]
                 )
 
         return state
+
+    def _normalize_state(self, state):
+        """归一化观测状态到 [-1, 1] 范围，便于神经网络学习
+
+        内部 self.state 保持原始值（用于交易逻辑），
+        此方法仅对返回给 agent 的观测进行归一化。
+        """
+        s = list(state)
+        n = self.stock_dim
+
+        # Cash / initial_amount → ~[0, 2]
+        s[0] = s[0] / self.initial_amount
+
+        # Prices / 1000 → ~[0, 2]
+        for i in range(1, n + 1):
+            s[i] = s[i] / 1000.0
+
+        # Shares / hmax → [0, 1]
+        for i in range(n + 1, 2 * n + 1):
+            s[i] = s[i] / max(self.hmax, 1)
+
+        # 技术指标归一化
+        indicator_scales = {
+            'macd': 50.0, 'boll_ub': 1000.0, 'boll_lb': 1000.0,
+            'rsi_30': 100.0, 'cci_30': 500.0, 'dx_30': 100.0,
+            'close_30_sma': 1000.0, 'close_60_sma': 1000.0,
+        }
+        base_idx = 2 * n + 1
+        for tech_idx, tech in enumerate(self.tech_indicator_list):
+            scale = indicator_scales.get(tech, 100.0)
+            for stock_idx in range(n):
+                idx = base_idx + tech_idx * n + stock_idx
+                if idx < len(s):
+                    s[idx] = s[idx] / scale
+
+        # Sentiment / 5 → [0, 1]
+        sent_base = base_idx + len(self.tech_indicator_list) * n
+        for i in range(sent_base, min(sent_base + n, len(s))):
+            s[i] = s[i] / 5.0
+
+        # Risk / 5 → [0, 1]
+        risk_base = sent_base + n
+        for i in range(risk_base, min(risk_base + n, len(s))):
+            s[i] = s[i] / 5.0
+
+        return s
 
     def _update_state(self):
         if len(self.df.tic.unique()) > 1:

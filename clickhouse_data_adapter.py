@@ -15,7 +15,7 @@ ClickHouse 数据适配器 for FinRL-DeepSeek 训练
 import os
 import sys
 import logging
-from datetime import datetime
+from datetime import datetime, timedelta
 from typing import Tuple, List, Optional
 import pandas as pd
 import numpy as np

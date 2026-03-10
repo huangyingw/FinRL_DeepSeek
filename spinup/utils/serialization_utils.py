@@ -10,7 +10,7 @@ def convert_json(obj):
                     for k,v in obj.items()}
 
         elif isinstance(obj, tuple):
-            return (convert_json(x) for x in obj)
+            return tuple(convert_json(x) for x in obj)
 
         elif isinstance(obj, list):
             return [convert_json(x) for x in obj]
