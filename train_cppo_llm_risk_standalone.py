@@ -13,17 +13,9 @@ import sys
 import warnings
 warnings.filterwarnings('ignore')
 
-# 添加项目根目录到路径以导入 MessageBus
-sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__)))))
-
-# 消息总线支持（可选）
-MESSAGE_BUS = None
-CORRELATION_ID = None
-try:
-    from trading_strategies.message_bus import MessageBus, EventType
-    MESSAGE_BUS_ENABLED = os.environ.get('ENABLE_MESSAGE_BUS', 'false').lower() == 'true'
-except ImportError:
-    MESSAGE_BUS_ENABLED = False
+# 添加项目根目录到路径（用于导入 config_loader, backtest 等）
+PROJECT_ROOT = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+sys.path.insert(0, PROJECT_ROOT)
 
 from datasets import load_dataset
 import pandas as pd
@@ -62,23 +54,6 @@ from spinup.utils.mpi_pytorch import setup_pytorch_for_mpi, sync_params, mpi_avg
 from spinup.utils.mpi_tools import mpi_fork, mpi_avg, proc_id, mpi_statistics_scalar, num_procs
 
 import time
-import uuid
-from datetime import datetime
-
-
-def publish_event(event_type: str, **kwargs):
-    """发布事件到消息总线（如果启用）"""
-    global MESSAGE_BUS, CORRELATION_ID
-    if MESSAGE_BUS is None:
-        return
-    try:
-        MESSAGE_BUS.publish_training_event(
-            event_type,
-            correlation_id=CORRELATION_ID,
-            **kwargs
-        )
-    except Exception as e:
-        print(f"[MessageBus] Failed to publish {event_type}: {e}")
 
 
 # Force GPU usage
@@ -733,19 +708,6 @@ if __name__ == "__main__":
 
     args = parser.parse_args()
 
-    # 初始化消息总线（如果启用）
-    if MESSAGE_BUS_ENABLED:
-        try:
-            MESSAGE_BUS = MessageBus(
-                redis_url=os.environ.get('REDIS_URL', 'redis://redis:6379'),
-                service_name="finrl-deepseek-trainer"
-            )
-            CORRELATION_ID = f"train-{datetime.now().strftime('%Y%m%d-%H%M%S')}-{uuid.uuid4().hex[:6]}"
-            print(f"[MessageBus] Enabled, correlation_id={CORRELATION_ID}")
-        except Exception as e:
-            print(f"[MessageBus] Failed to initialize: {e}")
-            MESSAGE_BUS = None
-
     from spinup.utils.run_utils import setup_logger_kwargs
     logger_kwargs = setup_logger_kwargs(args.exp_name, args.seed)
 
@@ -755,22 +717,21 @@ if __name__ == "__main__":
     print(f"Starting CPPO-DeepSeek training with {epochs} epochs...")
     print(f"Hyperparameters loaded from config file")
 
-    hyperparams = {
-        "epochs": epochs,
-        "seed": args.seed,
-        "exp_name": args.exp_name
-    }
-
-    # 发布训练开始事件
-    if MESSAGE_BUS_ENABLED:
-        publish_event(
-            EventType.TRAINING_STARTED,
-            hyperparams=hyperparams
-        )
-
     training_start_time = time.time()
-    model_path = None
 
+    trained_cppo = cppo(lambda: env_train, actor_critic=MLPActorCritic,
+                        seed=args.seed, logger_kwargs=logger_kwargs)
+
+    # Save the model
+    model_path = TRAINED_MODEL_DIR + f"/agent_cppo_deepseek_{epochs}_epochs.pth"
+    torch.save(trained_cppo.state_dict(), model_path)
+    training_duration = time.time() - training_start_time
+    print(f"Training finished in {training_duration/60:.1f} minutes, saved to {model_path}")
+
+    # 训练完成后自动回测（同一容器内直接调用，无需消息队列）
+    print("\n" + "=" * 60)
+    print("训练完成，开始自动回测...")
+    print("=" * 60)
     try:
         trained_cppo = cppo(lambda: env_train, actor_critic=MLPActorCritic,
                             seed=args.seed, logger_kwargs=logger_kwargs,
@@ -795,16 +756,13 @@ if __name__ == "__main__":
                 hyperparams=hyperparams
             )
 
+        # 训练完成后自动回测
+        import subprocess
+        backtest_script = os.path.join(PROJECT_ROOT, "backtest_finrl_deepseek.py")
+        subprocess.run(
+            [sys.executable, backtest_script, "--model", model_path],
+            check=True
+        )
     except Exception as e:
-        # 发布训练失败事件
-        if MESSAGE_BUS_ENABLED:
-            publish_event(
-                EventType.TRAINING_FAILED,
-                error=str(e),
-                hyperparams=hyperparams
-            )
-        raise
-    finally:
-        # 关闭消息总线
-        if MESSAGE_BUS is not None:
-            MESSAGE_BUS.close()
+        print(f"⚠️ 自动回测失败: {e}")
+        print(f"可手动运行: python backtest_finrl_deepseek.py --model {model_path}")
