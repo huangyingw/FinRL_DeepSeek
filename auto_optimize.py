@@ -38,7 +38,7 @@ os.makedirs(RESULTS_DIR, exist_ok=True)
 def load_data():
     """加载训练和验证数据"""
     training_config = get_training_config()
-    data_source = training_config['data_source'].lower()
+    data_source = os.environ.get('DATA_SOURCE', training_config['data_source']).lower()
 
     if data_source == 'clickhouse':
         logger.info("从 ClickHouse 加载数据...")
@@ -143,6 +143,7 @@ def train_and_evaluate(
     trial_name: str,
     ent_coef: float = 0.01,
     weight_decay: float = 1e-5,
+    **kwargs,
 ) -> float:
     """训练模型并返回验证集收益率"""
     import warnings
@@ -206,16 +207,34 @@ def train_and_evaluate(
     pi_optimizer = torch.optim.Adam(actor.parameters(), lr=pi_lr, weight_decay=weight_decay)
     vf_optimizer = torch.optim.Adam(critic.parameters(), lr=vf_lr, weight_decay=weight_decay)
 
+    # 学习率余弦退火
+    from torch.optim.lr_scheduler import CosineAnnealingLR
+    pi_scheduler = CosineAnnealingLR(pi_optimizer, T_max=epochs, eta_min=pi_lr * 0.01)
+    vf_scheduler = CosineAnnealingLR(vf_optimizer, T_max=epochs, eta_min=vf_lr * 0.01)
+
+    # 观测噪声
+    obs_noise_std = kwargs.get('obs_noise_std', 0.01)
+
+    # 早停：跟踪最佳验证得分
+    best_val_score = -float('inf')
+    best_actor_state = None
+    best_critic_state = None
+    no_improve_count = 0
+    early_stop_patience = 10
+
     # 训练循环
     for epoch in range(epochs):
         obs, _ = train_env.reset()
+        obs = np.asarray(obs, dtype=np.float32)
         done = False
         ep_ret = 0
 
         obs_buf, act_buf, rew_buf, val_buf, logp_buf = [], [], [], [], []
 
         while not done:
-            obs_tensor = torch.as_tensor(obs, dtype=torch.float32, device=DEVICE)
+            # 训练时添加观测噪声
+            obs_noisy = obs + np.random.normal(0, obs_noise_std, size=obs.shape).astype(np.float32) if obs_noise_std > 0 else obs
+            obs_tensor = torch.as_tensor(obs_noisy, dtype=torch.float32, device=DEVICE)
 
             with torch.no_grad():
                 dist = actor(obs_tensor)
@@ -233,7 +252,7 @@ def train_and_evaluate(
             val_buf.append(value.item())
             logp_buf.append(log_prob.item())
 
-            obs = next_obs
+            obs = np.asarray(next_obs, dtype=np.float32)
             ep_ret += reward
 
         # 计算优势和回报
@@ -287,22 +306,69 @@ def train_and_evaluate(
             torch.nn.utils.clip_grad_norm_(critic.parameters(), 0.5)
             vf_optimizer.step()
 
+        # 学习率退火
+        pi_scheduler.step()
+        vf_scheduler.step()
+
+        # 每 5 epochs 在验证集上评估
+        if epoch % 5 == 0 or epoch == epochs - 1:
+            val_obs, _ = val_env.reset()
+            val_obs = np.asarray(val_obs, dtype=np.float32)
+            val_done = False
+            val_portfolio = [initial_amount]
+
+            while not val_done:
+                val_obs_t = torch.as_tensor(val_obs, dtype=torch.float32, device=DEVICE)
+                with torch.no_grad():
+                    val_dist = actor(val_obs_t)
+                    val_action = val_dist.mean.cpu().numpy()
+                val_obs_raw, _, val_term, val_trunc, _ = val_env.step(val_action)
+                val_obs = np.asarray(val_obs_raw, dtype=np.float32)
+                val_done = val_term or val_trunc
+                s = val_env.state
+                sd = val_env.stock_dim
+                pv = s[0] + sum(s[1+i] * s[1+sd+i] for i in range(sd))
+                val_portfolio.append(pv)
+
+            val_pv = pd.Series(val_portfolio)
+            val_returns = val_pv.pct_change().dropna()
+            val_total_return = (val_portfolio[-1] - initial_amount) / initial_amount
+            val_sharpe = val_returns.mean() / val_returns.std() * (252 ** 0.5) if len(val_returns) > 1 and val_returns.std() > 0 else 0.0
+            val_cummax = val_pv.cummax()
+            val_dd = abs(((val_pv - val_cummax) / val_cummax).min())
+            val_score = 0.4 * val_sharpe + 0.4 * val_total_return - 0.2 * val_dd
+
+            if val_score > best_val_score:
+                best_val_score = val_score
+                best_actor_state = {k: v.clone() for k, v in actor.state_dict().items()}
+                best_critic_state = {k: v.clone() for k, v in critic.state_dict().items()}
+                no_improve_count = 0
+            else:
+                no_improve_count += 1
+
+            if no_improve_count >= early_stop_patience:
+                break
+
         if epoch % 10 == 0:
             logger.info(f"Epoch {epoch}: Train Return = {ep_ret:.2f}")
 
-    # 验证集评估
+    # 恢复最佳模型权重进行最终评估
+    if best_actor_state is not None:
+        actor.load_state_dict(best_actor_state)
+        critic.load_state_dict(best_critic_state)
+
+    # 验证集最终评估
     obs, _ = val_env.reset()
+    obs = np.asarray(obs, dtype=np.float32)
     done = False
-    val_ret = 0
     portfolio_values = [initial_amount]
 
     while not done:
         obs_tensor = torch.as_tensor(obs, dtype=torch.float32, device=DEVICE)
         action = actor.get_action(obs_tensor)
-        obs, reward, terminated, truncated, _ = val_env.step(action)
+        obs_raw, reward, terminated, truncated, _ = val_env.step(action)
+        obs = np.asarray(obs_raw, dtype=np.float32)
         done = terminated or truncated
-        val_ret += reward
-        # 追踪每日资产用于计算 Sharpe 和最大回撤
         s = val_env.state
         sd = val_env.stock_dim
         pv = s[0] + sum(s[1+i] * s[1+sd+i] for i in range(sd))
@@ -313,7 +379,6 @@ def train_and_evaluate(
     total_return = (final_value - initial_amount) / initial_amount
 
     # 计算 Sharpe 和最大回撤用于复合评分
-    import pandas as pd
     pv_series = pd.Series(portfolio_values)
     daily_returns = pv_series.pct_change().dropna()
 
@@ -356,6 +421,7 @@ def objective(trial: Trial, train_df: pd.DataFrame, val_df: pd.DataFrame) -> flo
         ),
         'ent_coef': trial.suggest_float('ent_coef', 0.0, 0.05),
         'weight_decay': trial.suggest_float('weight_decay', 1e-6, 1e-3, log=True),
+        'obs_noise_std': trial.suggest_float('obs_noise_std', 0.0, 0.05),
         'trial_name': f"trial_{trial.number}"
     }
 

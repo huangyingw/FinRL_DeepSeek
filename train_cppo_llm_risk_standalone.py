@@ -21,6 +21,20 @@ from datasets import load_dataset
 import pandas as pd
 from env_stocktrading_llm_risk import StockTradingEnv
 
+# Message bus (optional, graceful fallback)
+MESSAGE_BUS_ENABLED = os.environ.get('ENABLE_MESSAGE_BUS', 'false').lower() == 'true'
+if MESSAGE_BUS_ENABLED:
+    try:
+        from pkg.message_bus import publish_event, EventType
+    except ImportError:
+        MESSAGE_BUS_ENABLED = False
+if not MESSAGE_BUS_ENABLED:
+    class EventType:
+        TRAINING_PROGRESS = 'training_progress'
+        TRAINING_COMPLETED = 'training_completed'
+    def publish_event(*args, **kwargs):
+        pass
+
 # Define INDICATORS directly (avoiding finrl package dependencies)
 INDICATORS = [
     'macd',
@@ -478,6 +492,15 @@ def cppo(env_fn,
     pi_optimizer = Adam(ac.pi.parameters(), lr=pi_lr, weight_decay=weight_decay)
     vf_optimizer = Adam(ac.v.parameters(), lr=vf_lr, weight_decay=weight_decay)
 
+    # 学习率余弦退火：后期逐渐降低 LR，防止过拟合和震荡
+    from torch.optim.lr_scheduler import CosineAnnealingLR
+    pi_scheduler = CosineAnnealingLR(pi_optimizer, T_max=epochs, eta_min=pi_lr * 0.01)
+    vf_scheduler = CosineAnnealingLR(vf_optimizer, T_max=epochs, eta_min=vf_lr * 0.01)
+
+    # 观测噪声：训练时添加小幅高斯噪声，提升泛化能力
+    obs_noise_std = float(BEST_PARAMS.get('obs_noise_std', 0.01))
+    print(f"  lr_schedule=cosine(min={pi_lr*0.01:.2e}), obs_noise_std={obs_noise_std}")
+
     logger.setup_pytorch_saver(ac)
 
     def update():
@@ -539,8 +562,9 @@ def cppo(env_fn,
         update_num = 0
 
         for t in range(local_steps_per_epoch):
-            # 使用 float32 numpy 数组创建 tensor（避免 Python list → torch 的转换路径差异）
-            a, v, logp = ac.step(torch.as_tensor(o, device=DEVICE))
+            # 训练时添加观测噪声（数据增强），提升策略泛化能力
+            o_noisy = o + np.random.normal(0, obs_noise_std, size=o.shape).astype(np.float32) if obs_noise_std > 0 else o
+            a, v, logp = ac.step(torch.as_tensor(o_noisy, device=DEVICE))
 
             # Gymnasium 接口: step() 返回 5-tuple
             next_o_raw, r, terminated, truncated, _ = env.step(a)
@@ -615,6 +639,10 @@ def cppo(env_fn,
             logger.save_state({'env': env}, None)
 
         update()
+
+        # 学习率余弦退火
+        pi_scheduler.step()
+        vf_scheduler.step()
 
         logger.log_tabular('Epoch', epoch)
         logger.log_tabular('EpRet', with_min_and_max=True)
@@ -720,7 +748,8 @@ if __name__ == "__main__":
     training_start_time = time.time()
 
     trained_cppo = cppo(lambda: env_train, actor_critic=MLPActorCritic,
-                        seed=args.seed, logger_kwargs=logger_kwargs)
+                        seed=args.seed, logger_kwargs=logger_kwargs,
+                        env_val=env_val)
 
     # Save the model
     model_path = TRAINED_MODEL_DIR + f"/agent_cppo_deepseek_{epochs}_epochs.pth"
@@ -728,41 +757,19 @@ if __name__ == "__main__":
     training_duration = time.time() - training_start_time
     print(f"Training finished in {training_duration/60:.1f} minutes, saved to {model_path}")
 
-    # 训练完成后自动回测（同一容器内直接调用，无需消息队列）
-    print("\n" + "=" * 60)
-    print("训练完成，开始自动回测...")
+    # 训练完成后自动回测（优先使用 best_model.pth）
+    best_model_path = TRAINED_MODEL_DIR + "/best_model.pth"
+    backtest_model = best_model_path if os.path.exists(best_model_path) else model_path
+    print(f"\n{'=' * 60}")
+    print(f"训练完成，开始自动回测（模型: {os.path.basename(backtest_model)}）...")
     print("=" * 60)
     try:
-        trained_cppo = cppo(lambda: env_train, actor_critic=MLPActorCritic,
-                            seed=args.seed, logger_kwargs=logger_kwargs,
-                            env_val=env_val)
-
-        # Save the model
-        model_path = TRAINED_MODEL_DIR + f"/agent_cppo_deepseek_{epochs}_epochs.pth"
-        torch.save(trained_cppo.state_dict(), model_path)
-        print("Training finished and saved in " + model_path)
-
-        # 发布训练完成事件
-        if MESSAGE_BUS_ENABLED:
-            training_duration = time.time() - training_start_time
-            publish_event(
-                EventType.TRAINING_COMPLETED,
-                model_path=model_path,
-                metrics={
-                    "epochs": epochs,
-                    "duration_seconds": round(training_duration, 2),
-                    "duration_minutes": round(training_duration / 60, 1)
-                },
-                hyperparams=hyperparams
-            )
-
-        # 训练完成后自动回测
         import subprocess
         backtest_script = os.path.join(PROJECT_ROOT, "backtest_finrl_deepseek.py")
         subprocess.run(
-            [sys.executable, backtest_script, "--model", model_path],
+            [sys.executable, backtest_script, "--model", backtest_model],
             check=True
         )
     except Exception as e:
         print(f"⚠️ 自动回测失败: {e}")
-        print(f"可手动运行: python backtest_finrl_deepseek.py --model {model_path}")
+        print(f"可手动运行: python backtest_finrl_deepseek.py --model {backtest_model}")
