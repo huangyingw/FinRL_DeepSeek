@@ -3,17 +3,37 @@
 # Standalone training script for CPPO-DeepSeek
 # Run with: OMPI_ALLOW_RUN_AS_ROOT=1 OMPI_ALLOW_RUN_AS_ROOT_CONFIRM=1 mpirun -np 4 python3 train_cppo_llm_risk_standalone.py
 #
-# 环境变量:
-#   DATA_SOURCE: 'clickhouse' 或 'huggingface' (默认: huggingface)
-#   TRAIN_START_DATE: 训练开始日期 (默认: 2018-01-01)
-#   TRAIN_END_DATE: 训练结束日期 (默认: 2023-12-31)
+# 配置来源: config/settings.yaml (Docker 挂载)
+#   training.data_source: 'clickhouse' 或 'huggingface' (默认: clickhouse)
+#   training.lookback_days: 训练数据回溯天数 (默认: 1825，约5年)
+#   training.epochs: 训练轮数 (默认: 100)
 
 import os
+import sys
 import warnings
 warnings.filterwarnings('ignore')
 
+# 添加项目根目录到路径（用于导入 config_loader, backtest 等）
+PROJECT_ROOT = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+sys.path.insert(0, PROJECT_ROOT)
+
+from datasets import load_dataset
 import pandas as pd
 from env_stocktrading_llm_risk import StockTradingEnv
+
+# Message bus (optional, graceful fallback)
+MESSAGE_BUS_ENABLED = os.environ.get('ENABLE_MESSAGE_BUS', 'false').lower() == 'true'
+if MESSAGE_BUS_ENABLED:
+    try:
+        from pkg.message_bus import publish_event, EventType
+    except ImportError:
+        MESSAGE_BUS_ENABLED = False
+if not MESSAGE_BUS_ENABLED:
+    class EventType:
+        TRAINING_PROGRESS = 'training_progress'
+        TRAINING_COMPLETED = 'training_completed'
+    def publish_event(*args, **kwargs):
+        pass
 
 # Define INDICATORS directly (avoiding finrl package dependencies)
 INDICATORS = [
@@ -28,7 +48,8 @@ INDICATORS = [
 ]
 
 # Stateless: 模型保存到 Docker named volume
-TRAINED_MODEL_DIR = os.path.join(os.environ.get('MODELS_DIR', '/app/models'), 'finrl_deepseek', 'trained_models')
+from config_loader import get_models_dir, get_training_config
+TRAINED_MODEL_DIR = os.path.join(get_models_dir(), 'finrl_deepseek', 'trained_models')
 os.makedirs(TRAINED_MODEL_DIR, exist_ok=True)
 print(f"Model directory: {TRAINED_MODEL_DIR}")
 
@@ -48,6 +69,7 @@ from spinup.utils.mpi_tools import mpi_fork, mpi_avg, proc_id, mpi_statistics_sc
 
 import time
 
+
 # Force GPU usage
 if not torch.cuda.is_available():
     raise RuntimeError("CUDA is not available. This training requires GPU.")
@@ -57,17 +79,31 @@ print(f"GPU: {torch.cuda.get_device_name(0)}")
 
 
 def load_data():
-    """根据 DATA_SOURCE 环境变量加载训练数据"""
-    data_source = os.environ.get('DATA_SOURCE', 'huggingface').lower()
+    """根据配置文件加载训练和验证数据"""
+    training_config = get_training_config()
+    data_source = training_config['data_source'].lower()
+    test_ratio = float(training_config.get('test_ratio', 0.2))
+    val_df = None
 
     if data_source == 'clickhouse':
         print("Loading training data from ClickHouse...")
         try:
             from clickhouse_data_adapter import load_training_data
-            start_date = os.environ.get('TRAIN_START_DATE', '2018-01-01')
-            end_date = os.environ.get('TRAIN_END_DATE', '2023-12-31')
-            train, _ = load_training_data(start_date=start_date, end_date=end_date, test_ratio=0.0)
-            print(f"Loaded {len(train)} rows from ClickHouse ({start_date} to {end_date})")
+            # 优先使用环境变量指定的日期范围，回退到 lookback_days
+            start_date = os.environ.get('TRAIN_START_DATE')
+            end_date = os.environ.get('TRAIN_END_DATE')
+            lookback_days = training_config['lookback_days']
+            if start_date and end_date:
+                train, val_df = load_training_data(
+                    start_date=start_date, end_date=end_date, test_ratio=test_ratio)
+            else:
+                train, val_df = load_training_data(
+                    lookback_days=lookback_days, test_ratio=test_ratio)
+            actual_start = train['date'].min()
+            actual_end = train['date'].max()
+            print(f"Loaded {len(train)} training rows from ClickHouse ({actual_start} to {actual_end})")
+            if val_df is not None and len(val_df) > 0:
+                print(f"Loaded {len(val_df)} validation rows ({val_df['date'].min()} to {val_df['date'].max()})")
         except Exception as e:
             print(f"ClickHouse 加载失败: {e}")
             print("回退到 Hugging Face 数据...")
@@ -81,11 +117,21 @@ def load_data():
         if 'Unnamed: 0' in train.columns:
             train = train.drop('Unnamed: 0', axis=1)
 
-    return train
+        # 按时间拆分验证集
+        if test_ratio > 0:
+            unique_dates = sorted(train['date'].unique())
+            split_idx = int(len(unique_dates) * (1 - test_ratio))
+            train_dates = unique_dates[:split_idx]
+            val_dates = unique_dates[split_idx:]
+            val_df = train[train['date'].isin(val_dates)].copy()
+            train = train[train['date'].isin(train_dates)].copy()
+            print(f"Split: {len(train)} training rows, {len(val_df)} validation rows")
+
+    return train, val_df
 
 
 # Load data
-train = load_data()
+train, val_df = load_data()
 
 # Create a new index based on unique dates
 unique_dates = train['date'].unique()
@@ -102,6 +148,15 @@ stock_dimension = len(train.tic.unique())
 state_space = 1 + 2*stock_dimension + (2+len(INDICATORS))*stock_dimension
 print(f"Stock Dimension: {stock_dimension}, State Space: {state_space}")
 
+# 保存参考股票列表（供 backtester 使用）
+import json as _json
+_ref_stocks_path = os.path.join(os.environ.get('MODELS_DIR', '/app/models'), 'reference_stocks.json')
+_ref_stocks = sorted(train['tic'].unique().tolist())
+with open(_ref_stocks_path, 'w') as _f:
+    _json.dump({'stocks': _ref_stocks, 'count': len(_ref_stocks),
+                'data_source': os.environ.get('DATA_SOURCE', 'huggingface')}, _f, indent=2)
+print(f"Saved reference stocks ({len(_ref_stocks)}) to {_ref_stocks_path}")
+
 buy_cost_list = sell_cost_list = [0.001] * stock_dimension
 num_stock_shares = [0] * stock_dimension
 
@@ -110,7 +165,7 @@ def load_best_params():
     """从 Optuna 优化结果自动加载最佳超参数"""
     import json
     best_params_path = os.path.join(
-        os.environ.get('MODELS_DIR', '/app/models'),
+        get_models_dir(),
         'optuna_results', 'best_params.json'
     )
     if os.path.exists(best_params_path):
@@ -139,8 +194,24 @@ env_kwargs = {
     "reward_scaling": REWARD_SCALING
 }
 
-e_train_gym = StockTradingEnv(df=train, **env_kwargs)
-env_train, _ = e_train_gym.get_sb_env()
+# 使用原始 Gymnasium 环境（不使用 SB3 DummyVecEnv 包装器）
+# DummyVecEnv 添加 batch 维度导致 CUDA batch vs 单样本计算精度差异，
+# 使得 KL 在未更新策略时就已达到 ~0.02（应为 ~0）
+env_train = StockTradingEnv(df=train, **env_kwargs)
+
+# 验证环境（用于早停和过拟合检测）
+env_val = None
+if val_df is not None and len(val_df) > 0:
+    # 验证集需要相同的索引处理
+    val_unique_dates = val_df['date'].unique()
+    val_date_to_idx = {date: idx for idx, date in enumerate(sorted(val_unique_dates))}
+    val_df_indexed = val_df.copy()
+    val_df_indexed['new_idx'] = val_df_indexed['date'].map(val_date_to_idx)
+    val_df_indexed = val_df_indexed.set_index('new_idx')
+    val_df_indexed['llm_sentiment'].fillna(0, inplace=True)
+    val_df_indexed['llm_risk'].fillna(3, inplace=True)
+    env_val = StockTradingEnv(df=val_df_indexed, **env_kwargs)
+    print(f"Validation env created: {len(val_unique_dates)} trading days")
 
 
 # Neural Network Definitions
@@ -235,10 +306,19 @@ class MLPActorCritic(nn.Module):
 
     def step(self, obs):
         with torch.no_grad():
+            # 强制使用 2D tensor，确保与 batch update 使用相同的 CUDA GEMM kernel
+            # 避免 1D (gemv) vs 2D (gemm) 精度差异导致 logp 不一致
+            was_1d = obs.dim() == 1
+            if was_1d:
+                obs = obs.unsqueeze(0)
             pi = self.pi._distribution(obs)
             a = pi.sample()
             logp_a = self.pi._log_prob_from_distribution(pi, a)
             v = self.v(obs)
+            if was_1d:
+                a = a.squeeze(0)
+                logp_a = logp_a.squeeze(0)
+                v = v.squeeze(0)
         return a.cpu().numpy(), v.cpu().numpy(), logp_a.cpu().numpy()
 
     def act(self, obs):
@@ -263,10 +343,10 @@ class CPPOBuffer:
         assert self.ptr < self.max_size
         self.obs_buf[self.ptr] = obs
         self.act_buf[self.ptr] = act
-        self.rew_buf[self.ptr] = rew.item()
-        self.val_buf[self.ptr] = val.item()
-        self.valupdate_buf[self.ptr] = valupdate.item()
-        self.logp_buf[self.ptr] = logp.item()
+        self.rew_buf[self.ptr] = float(rew)
+        self.val_buf[self.ptr] = float(val)
+        self.valupdate_buf[self.ptr] = float(valupdate)
+        self.logp_buf[self.ptr] = float(logp)
         self.ptr += 1
 
     def finish_path(self, last_val=0):
@@ -276,7 +356,8 @@ class CPPOBuffer:
 
         deltas = rews[:-1] + self.gamma * vals[1:] - vals[:-1]
         self.adv_buf[path_slice] = core.discount_cumsum(deltas, self.gamma * self.lam)
-        self.adv_buf = self.adv_buf - self.valupdate_buf
+        # 只对当前 path 的 advantage 减去 CVaR 更新（修复：之前对整个 buffer 操作导致污染其他 trajectory）
+        self.adv_buf[path_slice] = self.adv_buf[path_slice] - self.valupdate_buf[path_slice]
         self.ret_buf[path_slice] = core.discount_cumsum(rews, self.gamma)[:-1]
         self.path_start_idx = self.ptr
 
@@ -298,6 +379,7 @@ def cppo(env_fn,
          steps_per_epoch=5000,
          epochs=None,
          gamma=None,
+         env_val=None,
          clip_ratio=None,
          pi_lr=None,
          vf_lr=None,
@@ -319,20 +401,24 @@ def cppo(env_fn,
          delay=1.0,
          cvar_clip_ratio=0.05):
     # 只从 best_params.json 读取超参数（Optuna 优化结果）
+    # 默认值基于 PPO 文献标准范围
     epochs = epochs or int(BEST_PARAMS.get('epochs', 100))
-    gamma = gamma or float(BEST_PARAMS.get('gamma', 0.995))
-    clip_ratio = clip_ratio or float(BEST_PARAMS.get('clip_ratio', 0.7))
-    pi_lr = pi_lr or float(BEST_PARAMS.get('pi_lr', 3e-5))
-    vf_lr = vf_lr or float(BEST_PARAMS.get('vf_lr', 1e-4))
-    train_pi_iters = train_pi_iters or int(BEST_PARAMS.get('train_pi_iters', 100))
-    train_v_iters = train_v_iters or int(BEST_PARAMS.get('train_v_iters', 100))
+    gamma = gamma or float(BEST_PARAMS.get('gamma', 0.99))
+    clip_ratio = clip_ratio or float(BEST_PARAMS.get('clip_ratio', 0.2))
+    pi_lr = pi_lr or float(BEST_PARAMS.get('pi_lr', 3e-4))
+    vf_lr = vf_lr or float(BEST_PARAMS.get('vf_lr', 1e-3))
+    train_pi_iters = train_pi_iters or int(BEST_PARAMS.get('train_pi_iters', 10))
+    train_v_iters = train_v_iters or int(BEST_PARAMS.get('train_v_iters', 10))
     lam = lam or float(BEST_PARAMS.get('lam', 0.95))
-    target_kl = target_kl or float(BEST_PARAMS.get('target_kl', 0.35))
+    target_kl = target_kl or float(BEST_PARAMS.get('target_kl', 0.03))
 
-    # 网络结构：从 best_params.json 读取（默认 512x512）
-    hidden_size_1 = int(BEST_PARAMS.get('hidden_size_1', 512))
-    hidden_size_2 = int(BEST_PARAMS.get('hidden_size_2', 512))
-    ac_kwargs = ac_kwargs or dict(hidden_sizes=[hidden_size_1, hidden_size_2], activation=torch.nn.ReLU)
+    # 网络结构：从 best_params.json 读取（默认 256x128）
+    hidden_size_1 = int(BEST_PARAMS.get('hidden_size_1', 256))
+    hidden_size_2 = int(BEST_PARAMS.get('hidden_size_2', 128))
+    # 使用 Tanh 激活函数（与 auto_optimize.py 一致）
+    # ReLU 在未归一化观测值（如 cash=1,000,000）下导致网络输出极大值，
+    # 引起 float32 精度问题使 batch 与单样本计算的 logp 不一致（KL 爆炸）
+    ac_kwargs = ac_kwargs or dict(hidden_sizes=[hidden_size_1, hidden_size_2], activation=torch.nn.Tanh)
 
     print(f"Training with optimized hyperparameters:")
     print(f"  epochs={epochs}, gamma={gamma:.4f}, clip_ratio={clip_ratio:.4f}")
@@ -371,15 +457,12 @@ def cppo(env_fn,
         """在线更新 running mean/std 并归一化观测"""
         nonlocal obs_rms_mean, obs_rms_var, obs_rms_count
         obs_flat = np.asarray(obs_raw, dtype=np.float64).flatten()
-        # NaN/Inf 替换
         obs_flat = np.nan_to_num(obs_flat, nan=0.0, posinf=1e6, neginf=-1e6)
-        # Welford's online algorithm
         obs_rms_count += 1
         delta = obs_flat - obs_rms_mean
         obs_rms_mean = obs_rms_mean + delta / obs_rms_count
         delta2 = obs_flat - obs_rms_mean
         obs_rms_var = obs_rms_var + delta * delta2
-        # 前 100 步不归一化（收集统计量）
         if obs_rms_count < 100:
             return np.clip(obs_flat, -10, 10).astype(np.float32).reshape(obs_raw.shape)
         std = np.sqrt(obs_rms_var / obs_rms_count + 1e-8)
@@ -394,6 +477,15 @@ def cppo(env_fn,
 
     from torch.optim import Adam
 
+    # KL 归一化：对多维动作空间，KL 除以动作维度数
+    # logp 是对所有维度求和，所以 KL 也是所有维度之和
+    # 归一化为 per-dimension KL 使 target_kl 语义与单维度动作一致
+    n_act_dims = act_dim[0] if isinstance(act_dim, tuple) else act_dim
+
+    # Entropy bonus 系数：鼓励探索，防止策略过早收敛
+    ent_coef = float(BEST_PARAMS.get('ent_coef', 0.01))
+    print(f"  ent_coef={ent_coef}, weight_decay=1e-5")
+
     def compute_loss_pi(data):
         obs, act, adv, logp_old = data['obs'], data['act'], data['adv'], data['logp']
         pi, logp = ac.pi(obs, act)
@@ -401,11 +493,16 @@ def cppo(env_fn,
         clip_adv = torch.clamp(ratio, 1-clip_ratio, 1+clip_ratio) * adv
         loss_pi = -(torch.min(ratio * adv, clip_adv)).mean()
 
-        approx_kl = (logp_old - logp).mean().item()
-        ent = pi.entropy().mean().item()
+        # Entropy bonus：鼓励策略保持探索性
+        ent = pi.entropy().mean()
+        loss_pi = loss_pi - ent_coef * ent
+
+        # Per-dimension KL：除以动作维度数，消除维度数量对 KL 总和的影响
+        approx_kl = (logp_old - logp).mean().item() / n_act_dims
+        ent_val = ent.item()
         clipped = ratio.gt(1+clip_ratio) | ratio.lt(1-clip_ratio)
         clipfrac = torch.as_tensor(clipped, dtype=torch.float32).mean().item()
-        pi_info = dict(kl=approx_kl, ent=ent, cf=clipfrac)
+        pi_info = dict(kl=approx_kl, ent=ent_val, cf=clipfrac)
 
         return loss_pi, pi_info
 
@@ -413,8 +510,18 @@ def cppo(env_fn,
         obs, ret = data['obs'], data['ret']
         return ((ac.v(obs) - ret)**2).mean()
 
-    pi_optimizer = Adam(ac.pi.parameters(), lr=pi_lr)
-    vf_optimizer = Adam(ac.v.parameters(), lr=vf_lr)
+    weight_decay = float(BEST_PARAMS.get('weight_decay', 1e-5))
+    pi_optimizer = Adam(ac.pi.parameters(), lr=pi_lr, weight_decay=weight_decay)
+    vf_optimizer = Adam(ac.v.parameters(), lr=vf_lr, weight_decay=weight_decay)
+
+    # 学习率余弦退火：后期逐渐降低 LR，防止过拟合和震荡
+    from torch.optim.lr_scheduler import CosineAnnealingLR
+    pi_scheduler = CosineAnnealingLR(pi_optimizer, T_max=epochs, eta_min=pi_lr * 0.01)
+    vf_scheduler = CosineAnnealingLR(vf_optimizer, T_max=epochs, eta_min=vf_lr * 0.01)
+
+    # 观测噪声：训练时添加小幅高斯噪声，提升泛化能力
+    obs_noise_std = float(BEST_PARAMS.get('obs_noise_std', 0.01))
+    print(f"  lr_schedule=cosine(min={pi_lr*0.01:.2e}), obs_noise_std={obs_noise_std}")
 
     logger.setup_pytorch_saver(ac)
 
@@ -433,6 +540,7 @@ def cppo(env_fn,
                 logger.log('Early stopping at step %d due to reaching max kl.' % i)
                 break
             loss_pi.backward()
+            torch.nn.utils.clip_grad_norm_(ac.pi.parameters(), 0.5)
             mpi_avg_grads(ac.pi)
             pi_optimizer.step()
 
@@ -441,7 +549,10 @@ def cppo(env_fn,
         for i in range(train_v_iters):
             vf_optimizer.zero_grad()
             loss_v = compute_loss_v(data)
+            # Value loss clipping 防止爆炸
+            loss_v = torch.clamp(loss_v, max=100.0)
             loss_v.backward()
+            torch.nn.utils.clip_grad_norm_(ac.v.parameters(), 0.5)
             mpi_avg_grads(ac.v)
             vf_optimizer.step()
 
@@ -452,8 +563,16 @@ def cppo(env_fn,
                      DeltaLossV=(loss_v.item() - v_l_old))
 
     start_time = time.time()
-    o, ep_ret, ep_len = env.reset(), 0, 0
-    o = normalize_obs(o)
+    # Gymnasium 接口: reset() 返回 (obs, info)
+    o_raw, _ = env.reset()
+    o = normalize_obs(np.asarray(o_raw, dtype=np.float32))
+    ep_ret, ep_len = 0, 0
+
+    # Early stopping: 连续 patience 次验证不改进则停止训练
+    patience = int(BEST_PARAMS.get('early_stopping_patience', 10))
+    best_val_return = -float('inf')
+    no_improve_count = 0
+    early_stopped = False
 
     for epoch in range(epochs):
         trajectory_num = 0
@@ -464,19 +583,28 @@ def cppo(env_fn,
         update_num = 0
 
         for t in range(local_steps_per_epoch):
-            a, v, logp = ac.step(torch.as_tensor(o, dtype=torch.float32, device=DEVICE))
+            # 训练时添加观测噪声（数据增强），提升策略泛化能力
+            o_noisy = o + np.random.normal(0, obs_noise_std, size=o.shape).astype(np.float32) if obs_noise_std > 0 else o
+            a, v, logp = ac.step(torch.as_tensor(o_noisy, device=DEVICE))
 
-            next_o, r, d, _ = env.step(a)
+            # Gymnasium 接口: step() 返回 5-tuple
+            next_o_raw, r, terminated, truncated, _ = env.step(a)
+            d = terminated or truncated
             ep_ret += r
             ep_len += 1
 
-            llm_risks = np.nan_to_num(np.array(next_o[0, -stock_dimension:]), nan=3.0)
+            # 统一转换为 float32 numpy + 归一化
+            next_o = normalize_obs(np.asarray(next_o_raw, dtype=np.float32))
+
+            # 从 env.state 读取原始值（观测已归一化，CVaR 计算需要原始值）
+            raw_state = env.state
+            llm_risks = np.nan_to_num(np.array(raw_state[-stock_dimension:], dtype=np.float32), nan=3.0)
 
             risk_to_weight = {1: 0.99, 2: 0.995, 3: 1.0, 4: 1.005, 5: 1.01}
             llm_risks_weights = np.vectorize(lambda x: risk_to_weight.get(int(round(x)), 1.0))(llm_risks)
 
-            prices = np.nan_to_num(np.array(next_o[0, 1:stock_dimension+1]))
-            shares = np.nan_to_num(np.array(next_o[0, stock_dimension+1:stock_dimension*2+1]))
+            prices = np.nan_to_num(np.array(raw_state[1:stock_dimension+1], dtype=np.float32))
+            shares = np.nan_to_num(np.array(raw_state[stock_dimension+1:stock_dimension*2+1], dtype=np.float32))
 
             stock_values = prices * shares
             total_value = np.sum(stock_values)
@@ -502,7 +630,7 @@ def cppo(env_fn,
             buf.store(o, a, r, v, updates, logp)
             logger.store(VVals=v)
 
-            o = normalize_obs(next_o)
+            o = next_o
 
             timeout = ep_len == max_ep_len
             terminal = d or timeout
@@ -512,13 +640,15 @@ def cppo(env_fn,
                 if epoch_ended and not terminal:
                     print('Warning: trajectory cut off by epoch at %d steps.' % ep_len, flush=True)
                 if timeout or epoch_ended:
-                    _, v, _ = ac.step(torch.as_tensor(o, dtype=torch.float32, device=DEVICE))
+                    _, v, _ = ac.step(torch.as_tensor(o, device=DEVICE))
                 else:
                     v = 0
                 buf.finish_path(v)
                 if terminal:
                     logger.store(EpRet=ep_ret, EpLen=ep_len)
-                o, ep_ret, ep_len = normalize_obs(env.reset()), 0, 0
+                o_raw, _ = env.reset()
+                o = normalize_obs(np.asarray(o_raw, dtype=np.float32))
+                ep_ret, ep_len = 0, 0
 
         if bad_trajectory_num > 0:
             lam_delta = lam_delta / bad_trajectory_num
@@ -530,6 +660,10 @@ def cppo(env_fn,
             logger.save_state({'env': env}, None)
 
         update()
+
+        # 学习率余弦退火
+        pi_scheduler.step()
+        vf_scheduler.step()
 
         logger.log_tabular('Epoch', epoch)
         logger.log_tabular('EpRet', with_min_and_max=True)
@@ -547,12 +681,67 @@ def cppo(env_fn,
         logger.log_tabular('Time', time.time() - start_time)
         logger.dump_tabular()
 
+        # 验证集评估（每 5 epochs）
+        if env_val is not None and (epoch % 5 == 0 or epoch == epochs - 1):
+            val_obs, _ = env_val.reset()
+            val_done = False
+            val_ret = 0
+            while not val_done:
+                val_obs_t = torch.as_tensor(np.asarray(val_obs, dtype=np.float32), device=DEVICE)
+                with torch.no_grad():
+                    val_a = ac.pi._distribution(val_obs_t.unsqueeze(0)).mean.squeeze(0)
+                val_obs, val_r, val_term, val_trunc, _ = env_val.step(val_a.cpu().numpy())
+                val_done = val_term or val_trunc
+                val_ret += val_r
+            # 计算验证集收益率
+            val_cash = env_val.state[0]
+            val_holdings = env_val.state[1:1+stock_dimension]
+            val_prices = env_val.state[1+stock_dimension:1+2*stock_dimension]
+            val_value = val_cash + sum(h * p for h, p in zip(val_holdings, val_prices))
+            val_return_pct = (val_value - 1000000) / 1000000 * 100
+            print(f"  [Val] Epoch {epoch}: Return={val_return_pct:.2f}%, FinalValue={val_value:.0f}")
+
+            # 保存最佳模型 + 早停检测
+            if val_return_pct > best_val_return:
+                best_val_return = val_return_pct
+                no_improve_count = 0
+                best_path = TRAINED_MODEL_DIR + "/best_model.pth"
+                torch.save(ac.state_dict(), best_path)
+                print(f"  [Val] New best! Saved to {best_path}")
+            else:
+                no_improve_count += 1
+                print(f"  [Val] No improvement for {no_improve_count}/{patience} evaluations")
+
+            if no_improve_count >= patience:
+                print(f"\n  [Early Stop] Stopping at epoch {epoch}/{epochs}")
+                print(f"  [Early Stop] Best validation return: {best_val_return:.2f}%")
+                early_stopped = True
+                break
+
         print("-" * 37)
         print("bad_trajectory_num:", bad_trajectory_num)
         print("update num:", update_num)
         print("nu:", nu)
         print("lam:", cvarlam)
         print("-" * 37, flush=True)
+
+        # 每 10 epochs 发布进度事件
+        if MESSAGE_BUS_ENABLED and (epoch + 1) % 10 == 0:
+            publish_event(
+                EventType.TRAINING_PROGRESS,
+                metrics={
+                    "epoch": epoch + 1,
+                    "total_epochs": epochs,
+                    "progress_pct": round((epoch + 1) / epochs * 100, 1),
+                    "elapsed_time": time.time() - start_time,
+                    "nu": float(nu),
+                    "lam": float(cvarlam)
+                }
+            )
+    if early_stopped:
+        print(f"Training ended early at epoch {epoch}/{epochs} (best val: {best_val_return:.2f}%)")
+    else:
+        print(f"Training completed all {epochs} epochs (best val: {best_val_return:.2f}%)")
     return ac
 
 
@@ -571,18 +760,23 @@ if __name__ == "__main__":
     from spinup.utils.run_utils import setup_logger_kwargs
     logger_kwargs = setup_logger_kwargs(args.exp_name, args.seed)
 
-    # 从环境变量读取超参数（由 cppo 函数内部处理）
-    epochs = int(os.environ.get('EPOCHS', 100))
+    # 从配置文件读取超参数
+    training_config = get_training_config()
+    epochs = training_config['epochs']
     print(f"Starting CPPO-DeepSeek training with {epochs} epochs...")
-    print(f"Hyperparameters loaded from environment variables")
+    print(f"Hyperparameters loaded from config file")
+
+    training_start_time = time.time()
 
     trained_cppo = cppo(lambda: env_train, actor_critic=MLPActorCritic,
-                        seed=args.seed, logger_kwargs=logger_kwargs)
+                        seed=args.seed, logger_kwargs=logger_kwargs,
+                        env_val=env_val)
 
     # Save the model
     model_path = TRAINED_MODEL_DIR + f"/agent_cppo_deepseek_{epochs}_epochs.pth"
     torch.save(trained_cppo.state_dict(), model_path)
-    print(f"Training finished, saved to {model_path}")
+    training_duration = time.time() - training_start_time
+    print(f"Training finished in {training_duration/60:.1f} minutes, saved to {model_path}")
 
     # 训练完成后自动回测（优先使用 best_model.pth）
     best_model_path = TRAINED_MODEL_DIR + "/best_model.pth"
@@ -591,8 +785,8 @@ if __name__ == "__main__":
     print(f"训练完成，开始自动回测（模型: {os.path.basename(backtest_model)}）...")
     print("=" * 60)
     try:
-        import subprocess, sys
-        backtest_script = os.path.join(os.path.dirname(os.path.abspath(__file__)), '..', '..', 'backtest_finrl_deepseek.py')
+        import subprocess
+        backtest_script = os.path.join(PROJECT_ROOT, "backtest_finrl_deepseek.py")
         subprocess.run(
             [sys.executable, backtest_script, "--model", backtest_model],
             check=True
