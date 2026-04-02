@@ -295,7 +295,7 @@ def cppo(env_fn,
          actor_critic=core.MLPActorCritic,
          ac_kwargs=None,
          seed=42,
-         steps_per_epoch=20000,
+         steps_per_epoch=5000,
          epochs=None,
          gamma=None,
          clip_ratio=None,
@@ -360,6 +360,31 @@ def cppo(env_fn,
 
     var_counts = tuple(core.count_vars(module) for module in [ac.pi, ac.v])
     logger.log('\nNumber of parameters: \t pi: %d, \t v: %d\n' % var_counts)
+
+    # 观测归一化：Running Mean/Std，防止大数值输入导致 NaN
+    obs_flat_dim = np.prod(obs_dim)
+    obs_rms_mean = np.zeros(obs_flat_dim, dtype=np.float64)
+    obs_rms_var = np.ones(obs_flat_dim, dtype=np.float64)
+    obs_rms_count = 0
+
+    def normalize_obs(obs_raw):
+        """在线更新 running mean/std 并归一化观测"""
+        nonlocal obs_rms_mean, obs_rms_var, obs_rms_count
+        obs_flat = np.asarray(obs_raw, dtype=np.float64).flatten()
+        # NaN/Inf 替换
+        obs_flat = np.nan_to_num(obs_flat, nan=0.0, posinf=1e6, neginf=-1e6)
+        # Welford's online algorithm
+        obs_rms_count += 1
+        delta = obs_flat - obs_rms_mean
+        obs_rms_mean = obs_rms_mean + delta / obs_rms_count
+        delta2 = obs_flat - obs_rms_mean
+        obs_rms_var = obs_rms_var + delta * delta2
+        # 前 100 步不归一化（收集统计量）
+        if obs_rms_count < 100:
+            return np.clip(obs_flat, -10, 10).astype(np.float32).reshape(obs_raw.shape)
+        std = np.sqrt(obs_rms_var / obs_rms_count + 1e-8)
+        normalized = (obs_flat - obs_rms_mean) / std
+        return np.clip(normalized, -10, 10).astype(np.float32).reshape(obs_raw.shape)
 
     local_steps_per_epoch = int(steps_per_epoch / num_procs())
     buf = CPPOBuffer(obs_dim, act_dim, local_steps_per_epoch, gamma, lam)
@@ -428,6 +453,7 @@ def cppo(env_fn,
 
     start_time = time.time()
     o, ep_ret, ep_len = env.reset(), 0, 0
+    o = normalize_obs(o)
 
     for epoch in range(epochs):
         trajectory_num = 0
@@ -444,13 +470,13 @@ def cppo(env_fn,
             ep_ret += r
             ep_len += 1
 
-            llm_risks = np.array(next_o[0, -stock_dimension:])
+            llm_risks = np.nan_to_num(np.array(next_o[0, -stock_dimension:]), nan=3.0)
 
             risk_to_weight = {1: 0.99, 2: 0.995, 3: 1.0, 4: 1.005, 5: 1.01}
-            llm_risks_weights = np.vectorize(risk_to_weight.get)(llm_risks)
+            llm_risks_weights = np.vectorize(lambda x: risk_to_weight.get(int(round(x)), 1.0))(llm_risks)
 
-            prices = np.array(next_o[0, 1:stock_dimension+1])
-            shares = np.array(next_o[0, stock_dimension+1:stock_dimension*2+1])
+            prices = np.nan_to_num(np.array(next_o[0, 1:stock_dimension+1]))
+            shares = np.nan_to_num(np.array(next_o[0, stock_dimension+1:stock_dimension*2+1]))
 
             stock_values = prices * shares
             total_value = np.sum(stock_values)
@@ -476,7 +502,7 @@ def cppo(env_fn,
             buf.store(o, a, r, v, updates, logp)
             logger.store(VVals=v)
 
-            o = next_o
+            o = normalize_obs(next_o)
 
             timeout = ep_len == max_ep_len
             terminal = d or timeout
@@ -492,7 +518,7 @@ def cppo(env_fn,
                 buf.finish_path(v)
                 if terminal:
                     logger.store(EpRet=ep_ret, EpLen=ep_len)
-                o, ep_ret, ep_len = env.reset(), 0, 0
+                o, ep_ret, ep_len = normalize_obs(env.reset()), 0, 0
 
         if bad_trajectory_num > 0:
             lam_delta = lam_delta / bad_trajectory_num
@@ -556,4 +582,21 @@ if __name__ == "__main__":
     # Save the model
     model_path = TRAINED_MODEL_DIR + f"/agent_cppo_deepseek_{epochs}_epochs.pth"
     torch.save(trained_cppo.state_dict(), model_path)
-    print("Training finished and saved in " + model_path)
+    print(f"Training finished, saved to {model_path}")
+
+    # 训练完成后自动回测（优先使用 best_model.pth）
+    best_model_path = TRAINED_MODEL_DIR + "/best_model.pth"
+    backtest_model = best_model_path if os.path.exists(best_model_path) else model_path
+    print(f"\n{'=' * 60}")
+    print(f"训练完成，开始自动回测（模型: {os.path.basename(backtest_model)}）...")
+    print("=" * 60)
+    try:
+        import subprocess, sys
+        backtest_script = os.path.join(os.path.dirname(os.path.abspath(__file__)), '..', '..', 'backtest_finrl_deepseek.py')
+        subprocess.run(
+            [sys.executable, backtest_script, "--model", backtest_model],
+            check=True
+        )
+    except Exception as e:
+        print(f"⚠️ 自动回测失败: {e}")
+        print(f"可手动运行: python backtest_finrl_deepseek.py --model {backtest_model}")
