@@ -426,6 +426,7 @@ class StockTradingEnv(gym.Env):
         # self.iteration=self.iteration
         self.rewards_memory = []
         self.actions_memory = []
+        self.state_memory = [self.state]
         self.date_memory = [self._get_date()]
 
         self.episode += 1
