@@ -13,7 +13,9 @@ DEFAULT_BACKEND = {
 }
 
 # Where experiment outputs are saved by default:
-DEFAULT_DATA_DIR = osp.join(osp.abspath(osp.dirname(osp.dirname(__file__))),'data')
+# 使用 MODELS_DIR 环境变量（K8s PVC 挂载点），避免写入 site-packages
+_models_dir = os.environ.get('MODELS_DIR', '/app/models')
+DEFAULT_DATA_DIR = osp.join(_models_dir, 'finrl_deepseek', 'checkpoints')
 
 # Whether to automatically insert a date and time stamp into the names of
 # save directories:
