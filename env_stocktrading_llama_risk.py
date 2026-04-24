@@ -428,6 +428,7 @@ class StockTradingEnv(gym.Env):
         self.rewards_memory = []
         self.actions_memory = []
         self.date_memory = [self._get_date()]
+        self.state_memory = [self.state]  # 修复 OOM: 清空 state_memory 防止跨 epoch 累积
 
         self.episode += 1
 
