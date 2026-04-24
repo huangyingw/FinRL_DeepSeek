@@ -656,8 +656,10 @@ def cppo(env_fn,
             nu_delta = nu_delta / trajectory_num
         nu = nu_delta * nu_delay
 
-        if (epoch % save_freq == 0) or (epoch == epochs - 1):
-            logger.save_state({'env': env}, None)
+        # 禁用 checkpoint 持久化 - best_model.pth 早停机制已保留最优模型
+        # save_state 会写入 local PVC (CHECKPOINTS_DIR)，产生大量临时文件影响磁盘
+        # if (epoch % save_freq == 0) or (epoch == epochs - 1):
+        #     logger.save_state({'env': env}, None)
 
         update()
 
