@@ -215,6 +215,25 @@ def train_and_evaluate(
     # 观测噪声
     obs_noise_std = kwargs.get('obs_noise_std', 0.01)
 
+    # 观测归一化 Running Mean/Std（与 standalone 训练保持一致，消除评估偏差）
+    obs_rms_mean = np.zeros(obs_dim, dtype=np.float64)
+    obs_rms_var = np.ones(obs_dim, dtype=np.float64)
+    obs_rms_count = 0
+
+    def normalize_obs(obs_raw):
+        nonlocal obs_rms_mean, obs_rms_var, obs_rms_count
+        obs_flat = np.asarray(obs_raw, dtype=np.float64).flatten()
+        obs_flat = np.nan_to_num(obs_flat, nan=0.0, posinf=1e6, neginf=-1e6)
+        obs_rms_count += 1
+        delta = obs_flat - obs_rms_mean
+        obs_rms_mean = obs_rms_mean + delta / obs_rms_count
+        delta2 = obs_flat - obs_rms_mean
+        obs_rms_var = obs_rms_var + delta * delta2
+        if obs_rms_count < 100:
+            return np.clip(obs_flat, -10, 10).astype(np.float32).reshape(obs_raw.shape)
+        std = np.sqrt(obs_rms_var / obs_rms_count + 1e-8)
+        return np.clip((obs_flat - obs_rms_mean) / std, -10, 10).astype(np.float32).reshape(obs_raw.shape)
+
     # 早停：跟踪最佳验证得分
     best_val_score = -float('inf')
     best_actor_state = None
@@ -225,7 +244,7 @@ def train_and_evaluate(
     # 训练循环
     for epoch in range(epochs):
         obs, _ = train_env.reset()
-        obs = np.asarray(obs, dtype=np.float32)
+        obs = normalize_obs(np.asarray(obs, dtype=np.float32))
         done = False
         ep_ret = 0
 
@@ -252,7 +271,7 @@ def train_and_evaluate(
             val_buf.append(value.item())
             logp_buf.append(log_prob.item())
 
-            obs = np.asarray(next_obs, dtype=np.float32)
+            obs = normalize_obs(np.asarray(next_obs, dtype=np.float32))
             ep_ret += reward
 
         # 计算优势和回报
@@ -313,7 +332,7 @@ def train_and_evaluate(
         # 每 5 epochs 在验证集上评估
         if epoch % 5 == 0 or epoch == epochs - 1:
             val_obs, _ = val_env.reset()
-            val_obs = np.asarray(val_obs, dtype=np.float32)
+            val_obs = normalize_obs(np.asarray(val_obs, dtype=np.float32))
             val_done = False
             val_portfolio = [initial_amount]
 
@@ -323,7 +342,7 @@ def train_and_evaluate(
                     val_dist = actor(val_obs_t)
                     val_action = val_dist.mean.cpu().numpy()
                 val_obs_raw, _, val_term, val_trunc, _ = val_env.step(val_action)
-                val_obs = np.asarray(val_obs_raw, dtype=np.float32)
+                val_obs = normalize_obs(np.asarray(val_obs_raw, dtype=np.float32))
                 val_done = val_term or val_trunc
                 s = val_env.state
                 sd = val_env.stock_dim
@@ -336,7 +355,8 @@ def train_and_evaluate(
             val_sharpe = val_returns.mean() / val_returns.std() * (252 ** 0.5) if len(val_returns) > 1 and val_returns.std() > 0 else 0.0
             val_cummax = val_pv.cummax()
             val_dd = abs(((val_pv - val_cummax) / val_cummax).min())
-            val_score = 0.4 * val_sharpe + 0.4 * val_total_return - 0.2 * val_dd
+            # 加强 MaxDD 惩罚（原 0.2 → 0.4），因完整训练观察到大网络易崩溃到 MaxDD 30%+
+            val_score = 0.3 * val_sharpe + 0.3 * val_total_return - 0.4 * val_dd
 
             if val_score > best_val_score:
                 best_val_score = val_score
@@ -391,8 +411,8 @@ def train_and_evaluate(
     drawdown = ((pv_series - cummax) / cummax).min()
     max_dd = abs(drawdown) if not pd.isna(drawdown) else 0.0
 
-    # 复合评分：收益 + 风险调整 - 回撤惩罚
-    score = 0.4 * sharpe + 0.4 * total_return - 0.2 * max_dd
+    # 复合评分：加强 MaxDD 惩罚以过滤掉完整训练会崩溃的参数组合
+    score = 0.3 * sharpe + 0.3 * total_return - 0.4 * max_dd
 
     logger.info(f"Trial {trial_name}: Return={total_return*100:.2f}%, Sharpe={sharpe:.3f}, MaxDD={max_dd*100:.1f}%, Score={score:.4f}")
 
@@ -400,8 +420,14 @@ def train_and_evaluate(
 
 
 def objective(trial: Trial, train_df: pd.DataFrame, val_df: pd.DataFrame) -> float:
-    """Optuna 目标函数"""
-    # 超参数搜索空间（扩展范围，包含正则化参数）
+    """Optuna 目标函数
+
+    搜索空间根据完整训练经验收紧（避免简化评估与完整训练差异大的区域）：
+    - hidden_sizes: 限制为 [64, 64]（Round 7/9a 已验证稳定；[128,256] 在完整训练会崩溃）
+    - ent_coef: 上限 0.03（高熵在简化训练好，完整训练收敛不了）
+    - obs_noise_std: 上限 0.02（基于 Round 9a=0.015 实验）
+    详见 docs/FINRL_AUTO_OPTIMIZE_CALIBRATION.md
+    """
     params = {
         'epochs': trial.suggest_int('epochs', 30, 200),
         'gamma': trial.suggest_float('gamma', 0.95, 0.999),
@@ -416,12 +442,12 @@ def objective(trial: Trial, train_df: pd.DataFrame, val_df: pd.DataFrame) -> flo
         'initial_amount': 1000000,
         'reward_scaling': trial.suggest_float('reward_scaling', 1e-6, 1e-2, log=True),
         'hidden_sizes': (
-            trial.suggest_categorical('hidden_size_1', [64, 128, 256]),
-            trial.suggest_categorical('hidden_size_2', [64, 128, 256]),
+            trial.suggest_categorical('hidden_size_1', [64]),
+            trial.suggest_categorical('hidden_size_2', [64]),
         ),
-        'ent_coef': trial.suggest_float('ent_coef', 0.0, 0.05),
+        'ent_coef': trial.suggest_float('ent_coef', 0.0, 0.03),
         'weight_decay': trial.suggest_float('weight_decay', 1e-6, 1e-3, log=True),
-        'obs_noise_std': trial.suggest_float('obs_noise_std', 0.0, 0.05),
+        'obs_noise_std': trial.suggest_float('obs_noise_std', 0.005, 0.02),
         'trial_name': f"trial_{trial.number}"
     }
 
