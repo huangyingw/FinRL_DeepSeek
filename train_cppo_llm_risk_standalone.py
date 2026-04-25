@@ -177,12 +177,36 @@ def load_best_params():
     return {}
 
 BEST_PARAMS = load_best_params()
+
+# Sweep 环境变量覆盖：允许 K8s sweep 通过环境变量临时覆盖单个参数
+# （仅用于 sweep 实验对比；常规训练仍以 best_params.json 为准）
+_ENV_OVERRIDE_MAP = {
+    'EPOCHS': ('epochs', int),
+    'OBS_NOISE_STD': ('obs_noise_std', float),
+    'ENT_COEF': ('ent_coef', float),
+    'LR': ('pi_lr', float),
+    'PI_LR': ('pi_lr', float),
+    'VF_LR': ('vf_lr', float),
+    'GAMMA': ('gamma', float),
+    'CLIP_RATIO': ('clip_ratio', float),
+    'HMAX': ('hmax', int),
+    'WEIGHT_DECAY': ('weight_decay', float),
+}
+for _env_key, (_param_key, _cast) in _ENV_OVERRIDE_MAP.items():
+    _val = os.environ.get(_env_key)
+    if _val is not None:
+        try:
+            BEST_PARAMS[_param_key] = _cast(_val)
+            print(f"🔧 Sweep override: {_param_key} = {BEST_PARAMS[_param_key]} (from env {_env_key})")
+        except (ValueError, TypeError) as _e:
+            print(f"⚠️ Invalid env override {_env_key}={_val}: {_e}")
+
 # 只从 best_params.json 读取，不使用环境变量回退
 HMAX = int(BEST_PARAMS.get('hmax', 100))
 _RAW_REWARD_SCALING = float(BEST_PARAMS.get('reward_scaling', 1e-4))
 # DSR 已是无量纲且数值小（~1e-3），不需要 PnL 那种 1e-4 的额外缩放
 # DSR 模式默认放大 100x 让网络看到合理梯度信号
-_REWARD_TYPE = str(BEST_PARAMS.get('reward_type', 'dsr'))
+_REWARD_TYPE = str(BEST_PARAMS.get('reward_type', 'pnl'))
 REWARD_SCALING = float(BEST_PARAMS.get('dsr_reward_scale', 100.0)) if _REWARD_TYPE == 'dsr' else _RAW_REWARD_SCALING
 
 env_kwargs = {
