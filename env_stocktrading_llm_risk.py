@@ -46,6 +46,10 @@ class StockTradingEnv(gym.Env):
         model_name="",
         mode="",
         iteration="",
+        # Differential Sharpe Ratio (Moody & Saffell 1998) — RL 直接优化 Sharpe
+        # reward_type='dsr' 启用 DSR；'pnl' 保持原 PnL 行为（向后兼容）
+        reward_type: str = "pnl",
+        dsr_eta: float = 0.01,  # EMA 衰减率（~100 步窗口）
     ):
         self.day = day
         self.df = df
@@ -85,6 +89,11 @@ class StockTradingEnv(gym.Env):
         self.cost = 0
         self.trades = 0
         self.episode = 0
+        # DSR 状态：A=收益EMA均值，B=收益平方EMA
+        self.reward_type = reward_type
+        self.dsr_eta = dsr_eta
+        self.dsr_A = 0.0
+        self.dsr_B = 0.0
         # memorize all the total balance change
         self.asset_memory = [
             self.initial_amount
@@ -382,9 +391,28 @@ class StockTradingEnv(gym.Env):
             )
             self.asset_memory.append(end_total_asset)
             self.date_memory.append(self._get_date())
-            self.reward = end_total_asset - begin_total_asset
-            self.rewards_memory.append(self.reward)
-            self.reward = self.reward * self.reward_scaling
+            pnl = end_total_asset - begin_total_asset
+            self.rewards_memory.append(pnl)
+
+            if self.reward_type == "dsr":
+                # Differential Sharpe Ratio (Moody & Saffell 1998)
+                # 单步收益率 r_t（避免大额变化导致数值不稳）
+                r_t = pnl / max(begin_total_asset, 1.0)
+                eta = self.dsr_eta
+                delta_A = r_t - self.dsr_A
+                delta_B = r_t * r_t - self.dsr_B
+                # DSR = (B*ΔA - 0.5*A*ΔB) / (B - A^2)^(3/2)
+                denom = (self.dsr_B - self.dsr_A * self.dsr_A) ** 1.5
+                if denom > 1e-8:
+                    dsr = (self.dsr_B * delta_A - 0.5 * self.dsr_A * delta_B) / denom
+                else:
+                    dsr = r_t  # warm-up: 直接用收益率
+                # 更新 EMA
+                self.dsr_A += eta * delta_A
+                self.dsr_B += eta * delta_B
+                self.reward = dsr * self.reward_scaling
+            else:
+                self.reward = pnl * self.reward_scaling
             self.state_memory.append(
                 self.state
             )  # add current state in state_recorder for each step
@@ -423,6 +451,9 @@ class StockTradingEnv(gym.Env):
         self.cost = 0
         self.trades = 0
         self.terminal = False
+        # 重置 DSR EMA 状态
+        self.dsr_A = 0.0
+        self.dsr_B = 0.0
         # self.iteration=self.iteration
         self.rewards_memory = []
         self.actions_memory = []

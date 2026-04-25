@@ -179,7 +179,11 @@ def load_best_params():
 BEST_PARAMS = load_best_params()
 # 只从 best_params.json 读取，不使用环境变量回退
 HMAX = int(BEST_PARAMS.get('hmax', 100))
-REWARD_SCALING = float(BEST_PARAMS.get('reward_scaling', 1e-4))
+_RAW_REWARD_SCALING = float(BEST_PARAMS.get('reward_scaling', 1e-4))
+# DSR 已是无量纲且数值小（~1e-3），不需要 PnL 那种 1e-4 的额外缩放
+# DSR 模式默认放大 100x 让网络看到合理梯度信号
+_REWARD_TYPE = str(BEST_PARAMS.get('reward_type', 'dsr'))
+REWARD_SCALING = float(BEST_PARAMS.get('dsr_reward_scale', 100.0)) if _REWARD_TYPE == 'dsr' else _RAW_REWARD_SCALING
 
 env_kwargs = {
     "hmax": HMAX,
@@ -191,7 +195,10 @@ env_kwargs = {
     "stock_dim": stock_dimension,
     "tech_indicator_list": INDICATORS,
     "action_space": stock_dimension,
-    "reward_scaling": REWARD_SCALING
+    "reward_scaling": REWARD_SCALING,
+    # Differential Sharpe Ratio：直接优化 Sharpe 比率而非纯 PnL
+    "reward_type": str(BEST_PARAMS.get('reward_type', 'dsr')),
+    "dsr_eta": float(BEST_PARAMS.get('dsr_eta', 0.01)),
 }
 
 # 使用原始 Gymnasium 环境（不使用 SB3 DummyVecEnv 包装器）
