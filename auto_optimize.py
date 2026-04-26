@@ -420,13 +420,10 @@ def train_and_evaluate(
 
 
 def objective(trial: Trial, train_df: pd.DataFrame, val_df: pd.DataFrame) -> float:
-    """Optuna 目标函数
+    """[已废弃] Optuna 单 fidelity 目标函数
 
-    搜索空间根据完整训练经验收紧（避免简化评估与完整训练差异大的区域）：
-    - hidden_sizes: 限制为 [64, 64]（Round 7/9a 已验证稳定；[128,256] 在完整训练会崩溃）
-    - ent_coef: 上限 0.03（高熵在简化训练好，完整训练收敛不了）
-    - obs_noise_std: 上限 0.02（基于 Round 9a=0.015 实验）
-    详见 docs/FINRL_AUTO_OPTIMIZE_CALIBRATION.md
+    已被 Ray Tune Multi-Fidelity ASHA 替代（见 main_raytune），保留仅供向后兼容。
+    新代码请走 main_raytune 路径，由 ASHA 自动处理 fidelity 维度。
     """
     params = {
         'epochs': trial.suggest_int('epochs', 30, 200),
@@ -442,12 +439,12 @@ def objective(trial: Trial, train_df: pd.DataFrame, val_df: pd.DataFrame) -> flo
         'initial_amount': 1000000,
         'reward_scaling': trial.suggest_float('reward_scaling', 1e-6, 1e-2, log=True),
         'hidden_sizes': (
-            trial.suggest_categorical('hidden_size_1', [64]),
-            trial.suggest_categorical('hidden_size_2', [64]),
+            trial.suggest_categorical('hidden_size_1', [64, 128, 256]),
+            trial.suggest_categorical('hidden_size_2', [64, 128, 256]),
         ),
-        'ent_coef': trial.suggest_float('ent_coef', 0.0, 0.03),
+        'ent_coef': trial.suggest_float('ent_coef', 0.0, 0.05),
         'weight_decay': trial.suggest_float('weight_decay', 1e-6, 1e-3, log=True),
-        'obs_noise_std': trial.suggest_float('obs_noise_std', 0.005, 0.02),
+        'obs_noise_std': trial.suggest_float('obs_noise_std', 0.0, 0.05),
         'trial_name': f"trial_{trial.number}"
     }
 
@@ -459,14 +456,134 @@ def objective(trial: Trial, train_df: pd.DataFrame, val_df: pd.DataFrame) -> flo
         return -1.0  # 失败的 trial 返回负收益
 
 
+# ============================================================
+# Ray Tune + Multi-Fidelity ASHA（推荐路径）
+#
+# 设计理由（见 docs/AUTOML_FRAMEWORK_SELECTION.md）：
+# - epoch 作为 fidelity 维度，ASHA 自动决定何时把"小 epoch 表现好的配置"提升到完整训练
+# - OptunaSearch Sampler 保留 Bayesian 采样能力 + Ray Tune 的并行/调度
+# - 解除 hidden_sizes 等手工硬编码约束（让框架学）
+# ============================================================
+
+def raytune_train_and_evaluate(config: dict, train_df: pd.DataFrame, val_df: pd.DataFrame):
+    """Ray Tune trainable: 接收 config dict，每个 epoch 报告 metric 给 ASHA"""
+    from ray import tune
+    import time
+
+    # config 包含完整搜索空间 + ASHA 注入的 max_epoch（fidelity）
+    params = dict(config)
+    # ASHA 用 epochs 作为 fidelity 维度
+    epochs = int(params.pop('epochs'))
+    hidden_sizes = (int(params.pop('hidden_size_1')), int(params.pop('hidden_size_2')))
+    params['hidden_sizes'] = hidden_sizes
+    params['epochs'] = epochs
+    params['initial_amount'] = 1000000
+    params['trial_name'] = f"ray_{int(time.time())}"
+
+    try:
+        score = train_and_evaluate(train_df, val_df, **params)
+        # 单点 report；ASHA 已内置 epoch 维度的 fidelity 推进
+        tune.report({'score': score, 'epochs': epochs})
+    except Exception as e:
+        logger.error(f"Ray Tune trial failed: {e}")
+        tune.report({'score': -1.0, 'epochs': epochs})
+
+
+def build_raytune_search_space() -> dict:
+    """Ray Tune 搜索空间（不再手工硬编码约束，让 ASHA 自动学习）"""
+    from ray import tune
+    return {
+        'epochs': tune.choice([50, 100, 138, 180, 200]),  # ASHA fidelity 维度
+        'gamma': tune.uniform(0.95, 0.999),
+        'clip_ratio': tune.uniform(0.1, 0.3),
+        'pi_lr': tune.loguniform(1e-5, 1e-3),
+        'vf_lr': tune.loguniform(1e-5, 1e-3),
+        'train_pi_iters': tune.randint(5, 80),
+        'train_v_iters': tune.randint(5, 80),
+        'lam': tune.uniform(0.9, 0.99),
+        'target_kl': tune.uniform(0.005, 0.1),
+        'hmax': tune.randint(50, 300),
+        'reward_scaling': tune.loguniform(1e-6, 1e-2),
+        'hidden_size_1': tune.choice([64, 128, 256]),
+        'hidden_size_2': tune.choice([64, 128, 256]),
+        'ent_coef': tune.uniform(0.0, 0.05),
+        'weight_decay': tune.loguniform(1e-6, 1e-3),
+        'obs_noise_std': tune.uniform(0.0, 0.05),
+    }
+
+
+def raytune_run(train_df, val_df, n_trials: int, max_concurrent: int = 1):
+    """Ray Tune + OptunaSearch + ASHA 主入口
+
+    points_to_evaluate 用 Round 7/9a/11 真实回测最佳点作先验热启动
+    """
+    from functools import partial
+    from ray import tune
+    from ray.tune.search.optuna import OptunaSearch
+    from ray.tune.schedulers import ASHAScheduler
+
+    search_space = build_raytune_search_space()
+
+    # 历史完整训练真实最佳作为 prior（Round 11 winner: long_train_180）
+    points_to_evaluate = [{
+        'epochs': 180,
+        'gamma': 0.972709116752409,
+        'clip_ratio': 0.11227346352610473,
+        'pi_lr': 2.0131428489540617e-05,
+        'vf_lr': 0.0005678133375978763,
+        'train_pi_iters': 33,
+        'train_v_iters': 7,
+        'lam': 0.9899690665828681,
+        'target_kl': 0.04719432475234017,
+        'hmax': 194,
+        'reward_scaling': 6.0879465081638936e-05,
+        'hidden_size_1': 64,
+        'hidden_size_2': 64,
+        'ent_coef': 0.021919826902037476,
+        'weight_decay': 3.2598665602231373e-05,
+        'obs_noise_std': 0.015,
+    }]
+
+    optuna_search = OptunaSearch(
+        metric='score',
+        mode='max',
+        points_to_evaluate=points_to_evaluate,
+    )
+
+    # ASHA: 把 epochs 作为 fidelity，把表现差的 trial 早停
+    asha = ASHAScheduler(
+        metric='score',
+        mode='max',
+        max_t=200,           # 最大 epoch
+        grace_period=30,     # 至少跑 30 epoch 才考虑早停
+        reduction_factor=3,  # 每轮淘汰 2/3
+    )
+
+    trainable = partial(raytune_train_and_evaluate, train_df=train_df, val_df=val_df)
+    analysis = tune.run(
+        trainable,
+        config=search_space,
+        num_samples=n_trials,
+        search_alg=optuna_search,
+        scheduler=asha,
+        max_concurrent_trials=max_concurrent,
+        verbose=1,
+    )
+    return analysis
+
+
 def main():
     parser = argparse.ArgumentParser(description='FinRL-DeepSeek 自动化超参数优化')
     parser.add_argument('--trials', type=int, default=50, help='优化试验次数')
     parser.add_argument('--study-name', type=str, default='finrl-deepseek-optuna', help='Optuna study 名称')
+    parser.add_argument('--engine', choices=['raytune', 'optuna'], default='raytune',
+                        help='调参引擎：raytune (Ray Tune + ASHA, 推荐) | optuna (单 fidelity, 已废弃)')
+    parser.add_argument('--max-concurrent', type=int, default=1,
+                        help='Ray Tune 并发 trial 数（单 GPU=1，多 GPU 可调大）')
     args = parser.parse_args()
 
     logger.info("=" * 60)
-    logger.info("FinRL-DeepSeek 自动化超参数优化")
+    logger.info(f"FinRL-DeepSeek 自动化超参数优化（engine={args.engine}）")
     logger.info("=" * 60)
 
     # 检查 GPU
@@ -478,21 +595,52 @@ def main():
     # 加载数据
     train_df, val_df = load_data()
 
-    # 创建 Optuna study
+    if args.engine == 'raytune':
+        # Ray Tune + Multi-Fidelity ASHA（推荐路径）
+        analysis = raytune_run(train_df, val_df, n_trials=args.trials,
+                               max_concurrent=args.max_concurrent)
+        best_trial = analysis.get_best_trial(metric='score', mode='max')
+        best_params = dict(best_trial.config)
+        best_value = best_trial.last_result['score']
+
+        logger.info("=" * 60)
+        logger.info("Ray Tune 优化完成!")
+        logger.info(f"最佳得分: {best_value:.4f}")
+        logger.info("最佳参数:")
+        for key, value in best_params.items():
+            logger.info(f"  {key}: {value}")
+
+        best_params_file = os.path.join(RESULTS_DIR, 'best_params.json')
+        with open(best_params_file, 'w') as f:
+            json.dump({
+                'best_value': best_value,
+                'best_params': best_params,
+                'engine': 'raytune+asha',
+                'timestamp': datetime.now().isoformat()
+            }, f, indent=2)
+        logger.info(f"最佳参数已保存到: {best_params_file}")
+
+        # 保存所有 trial 结果
+        trials_df = analysis.dataframe()
+        trials_file = os.path.join(RESULTS_DIR, 'all_trials.csv')
+        trials_df.to_csv(trials_file, index=False)
+        logger.info(f"所有试验结果已保存到: {trials_file}")
+        return
+
+    # ===== 旧路径：Optuna 单 fidelity（已废弃，仅向后兼容）=====
+    logger.warning("⚠️  使用旧 Optuna 路径，存在简化训练 vs 完整训练偏差问题。"
+                   "推荐 --engine raytune（见 docs/AUTOML_FRAMEWORK_SELECTION.md）")
     study = optuna.create_study(
         study_name=args.study_name,
-        direction='maximize',  # 最大化收益率
+        direction='maximize',
         pruner=optuna.pruners.MedianPruner()
     )
-
-    # 运行优化
     study.optimize(
         lambda trial: objective(trial, train_df, val_df),
         n_trials=args.trials,
         show_progress_bar=True
     )
 
-    # 保存结果
     logger.info("=" * 60)
     logger.info("优化完成!")
     logger.info(f"最佳收益率: {study.best_value * 100:.2f}%")
@@ -500,17 +648,16 @@ def main():
     for key, value in study.best_params.items():
         logger.info(f"  {key}: {value}")
 
-    # 保存最佳参数
     best_params_file = os.path.join(RESULTS_DIR, 'best_params.json')
     with open(best_params_file, 'w') as f:
         json.dump({
             'best_value': study.best_value,
             'best_params': study.best_params,
+            'engine': 'optuna_legacy',
             'timestamp': datetime.now().isoformat()
         }, f, indent=2)
     logger.info(f"最佳参数已保存到: {best_params_file}")
 
-    # 保存所有试验结果
     trials_df = study.trials_dataframe()
     trials_file = os.path.join(RESULTS_DIR, 'all_trials.csv')
     trials_df.to_csv(trials_file, index=False)
