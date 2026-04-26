@@ -581,10 +581,44 @@ if __name__ == "__main__":
     print(f"Starting CPPO-DeepSeek training with {epochs} epochs...")
     print(f"Hyperparameters loaded from environment variables")
 
-    trained_cppo = cppo(lambda: env_train, actor_critic=MLPActorCritic,
-                        seed=args.seed, logger_kwargs=logger_kwargs)
+    # MLflow 实验跟踪（详见 pkg/mlops/mlflow_client.py）
+    # 失败不阻塞训练；HPO trial 走 auto_optimize.py 内部的 nested run
+    try:
+        from pkg.mlops import log_run
+        _mlflow_ctx = log_run(
+            experiment="finrl_deepseek",
+            run_name=f"{args.exp_name}_seed{args.seed}",
+            tags={"entry": "standalone_trainer", "epochs": str(epochs)},
+        )
+    except Exception as _e:
+        print(f"⚠️ MLflow 不可用，跳过实验跟踪: {_e}")
+        from contextlib import nullcontext
+        _mlflow_ctx = nullcontext()
 
-    # Save the model
-    model_path = TRAINED_MODEL_DIR + f"/agent_cppo_deepseek_{epochs}_epochs.pth"
-    torch.save(trained_cppo.state_dict(), model_path)
-    print("Training finished and saved in " + model_path)
+    with _mlflow_ctx as _mlrun:
+        # 记录 hyperparams
+        if _mlrun is not None:
+            try:
+                _mlrun.log_params({k: v for k, v in BEST_PARAMS.items() if isinstance(v, (int, float, str, bool))})
+                _mlrun.log_params({"epochs": epochs, "seed": args.seed})
+            except Exception as _e:
+                print(f"⚠️ MLflow log_params 失败: {_e}")
+
+        trained_cppo = cppo(lambda: env_train, actor_critic=MLPActorCritic,
+                            seed=args.seed, logger_kwargs=logger_kwargs)
+
+        # Save the model
+        model_path = TRAINED_MODEL_DIR + f"/agent_cppo_deepseek_{epochs}_epochs.pth"
+        torch.save(trained_cppo.state_dict(), model_path)
+        print("Training finished and saved in " + model_path)
+
+        # MLflow 上传 artifact + 注册（best_model.pth 由训练循环已保存）
+        if _mlrun is not None:
+            try:
+                _mlrun.log_artifact(model_path, artifact_path="model")
+                best_model_path = TRAINED_MODEL_DIR + "/best_model.pth"
+                if os.path.exists(best_model_path):
+                    _mlrun.log_artifact(best_model_path, artifact_path="model")
+                print(f"✅ MLflow run_id={_mlrun.run_id} 已记录")
+            except Exception as _e:
+                print(f"⚠️ MLflow log_artifact 失败: {_e}")

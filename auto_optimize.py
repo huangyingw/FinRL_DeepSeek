@@ -416,6 +416,31 @@ def train_and_evaluate(
 
     logger.info(f"Trial {trial_name}: Return={total_return*100:.2f}%, Sharpe={sharpe:.3f}, MaxDD={max_dd*100:.1f}%, Score={score:.4f}")
 
+    # MLflow 记录 trial（HPO 父 run 中的 nested run）
+    try:
+        from pkg.mlops import log_run
+        with log_run(experiment="finrl_deepseek", run_name=trial_name,
+                     tags={"entry": "hpo_trial"}, nested=True) as _mlrun:
+            _mlrun.log_params({k: v for k, v in kwargs.items()
+                               if isinstance(v, (int, float, str, bool))})
+            _mlrun.log_params({
+                "epochs": epochs, "gamma": gamma, "clip_ratio": clip_ratio,
+                "pi_lr": pi_lr, "vf_lr": vf_lr,
+                "train_pi_iters": train_pi_iters, "train_v_iters": train_v_iters,
+                "lam": lam, "target_kl": target_kl, "hmax": hmax,
+                "reward_scaling": reward_scaling,
+                "hidden_size_1": hidden_sizes[0], "hidden_size_2": hidden_sizes[1],
+                "ent_coef": ent_coef, "weight_decay": weight_decay,
+            })
+            _mlrun.log_metrics({
+                "score": score,
+                "total_return": total_return,
+                "sharpe": sharpe,
+                "max_drawdown": max_dd,
+            })
+    except Exception as _e:
+        logger.debug(f"MLflow trial 记录跳过: {_e}")
+
     return score
 
 
@@ -595,33 +620,116 @@ def main():
     # 加载数据
     train_df, val_df = load_data()
 
-    if args.engine == 'raytune':
-        # Ray Tune + Multi-Fidelity ASHA（推荐路径）
-        analysis = raytune_run(train_df, val_df, n_trials=args.trials,
-                               max_concurrent=args.max_concurrent)
-        best_trial = analysis.get_best_trial(metric='score', mode='max')
-        best_params = dict(best_trial.config)
-        best_value = best_trial.last_result['score']
+    # MLflow 父 run（HPO 整体），各 trial 在 objective() 内嵌套
+    try:
+        from pkg.mlops import log_run
+        _hpo_ctx = log_run(
+            experiment="finrl_deepseek",
+            run_name=f"hpo_{args.engine}_{args.study_name}",
+            tags={"entry": "hpo_main", "engine": args.engine, "trials": str(args.trials)},
+        )
+    except Exception as _e:
+        logger.warning(f"MLflow 不可用，HPO 父 run 跳过: {_e}")
+        from contextlib import nullcontext
+        _hpo_ctx = nullcontext()
+
+    with _hpo_ctx as _hpo_run:
+        if args.engine == 'raytune':
+            # Ray Tune + Multi-Fidelity ASHA（推荐路径）
+            analysis = raytune_run(train_df, val_df, n_trials=args.trials,
+                                   max_concurrent=args.max_concurrent)
+            best_trial = analysis.get_best_trial(metric='score', mode='max')
+            best_params = dict(best_trial.config)
+            best_value = best_trial.last_result['score']
+
+            logger.info("=" * 60)
+            logger.info("Ray Tune 优化完成!")
+            logger.info(f"最佳得分: {best_value:.4f}")
+            logger.info("最佳参数:")
+            for key, value in best_params.items():
+                logger.info(f"  {key}: {value}")
+
+            # MLflow 记录最佳 metrics + params
+            if _hpo_run is not None:
+                try:
+                    _hpo_run.log_params({k: v for k, v in best_params.items()
+                                         if isinstance(v, (int, float, str, bool))})
+                    _hpo_run.log_metrics({"best_score": best_value})
+                except Exception as _e:
+                    logger.debug(f"MLflow 父 run 记录跳过: {_e}")
+
+            # 保存最佳参数到 ParamStore（Redis 后端，统一参数管理）
+            # source 字段携带 mlflow run_id 供互引用
+            mlflow_source = f"raytune+asha|mlflow:{_hpo_run.run_id}" if _hpo_run is not None else "raytune+asha"
+            try:
+                from pkg.params import get_store
+                store = get_store()
+                updates = {
+                    f'finrl_deepseek.{k}': v
+                    for k, v in best_params.items()
+                }
+                store.update_batch(updates, source=mlflow_source, performance=best_value)
+                logger.info(
+                    f"最佳参数已写入 ParamStore (namespace=finrl_deepseek, "
+                    f"{len(updates)} 个参数, best_value={best_value:.4f})"
+                )
+            except ImportError:
+                logger.error(
+                    "无法导入 pkg.params，请确认父项目 PYTHONPATH 正确（K8s 已通过镜像 build 挂载）"
+                )
+                raise
+
+            # 保存所有 trial 结果（仅作为审计/调试用途）
+            trials_df = analysis.dataframe()
+            trials_file = os.path.join(RESULTS_DIR, 'all_trials.csv')
+            trials_df.to_csv(trials_file, index=False)
+            logger.info(f"所有试验结果已保存到: {trials_file}")
+            return
+
+        # ===== 旧路径：Optuna 单 fidelity（已废弃，仅向后兼容）=====
+        logger.warning("⚠️  使用旧 Optuna 路径，存在简化训练 vs 完整训练偏差问题。"
+                       "推荐 --engine raytune（见 docs/AUTOML_FRAMEWORK_SELECTION.md）")
+        study = optuna.create_study(
+            study_name=args.study_name,
+            direction='maximize',
+            pruner=optuna.pruners.MedianPruner()
+        )
+        study.optimize(
+            lambda trial: objective(trial, train_df, val_df),
+            n_trials=args.trials,
+            show_progress_bar=True
+        )
 
         logger.info("=" * 60)
-        logger.info("Ray Tune 优化完成!")
-        logger.info(f"最佳得分: {best_value:.4f}")
-        logger.info("最佳参数:")
-        for key, value in best_params.items():
+        logger.info("优化完成!")
+        logger.info(f"最佳收益率: {study.best_value * 100:.2f}%")
+        logger.info(f"最佳参数:")
+        for key, value in study.best_params.items():
             logger.info(f"  {key}: {value}")
 
+        # MLflow 记录最佳 metrics + params
+        if _hpo_run is not None:
+            try:
+                _hpo_run.log_params({k: v for k, v in study.best_params.items()
+                                     if isinstance(v, (int, float, str, bool))})
+                _hpo_run.log_metrics({"best_value": study.best_value})
+            except Exception as _e:
+                logger.debug(f"MLflow 父 run 记录跳过: {_e}")
+
         # 保存最佳参数到 ParamStore（Redis 后端，统一参数管理）
+        # 父项目 pkg.params 路径已挂载在 PYTHONPATH 中
+        mlflow_source = f"optuna_legacy|mlflow:{_hpo_run.run_id}" if _hpo_run is not None else "optuna_legacy"
         try:
             from pkg.params import get_store
             store = get_store()
             updates = {
                 f'finrl_deepseek.{k}': v
-                for k, v in best_params.items()
+                for k, v in study.best_params.items()
             }
-            store.update_batch(updates, source='raytune+asha', performance=best_value)
+            store.update_batch(updates, source=mlflow_source, performance=study.best_value)
             logger.info(
                 f"最佳参数已写入 ParamStore (namespace=finrl_deepseek, "
-                f"{len(updates)} 个参数, best_value={best_value:.4f})"
+                f"{len(updates)} 个参数, best_value={study.best_value:.4f})"
             )
         except ImportError:
             logger.error(
@@ -629,58 +737,10 @@ def main():
             )
             raise
 
-        # 保存所有 trial 结果（仅作为审计/调试用途）
-        trials_df = analysis.dataframe()
+        trials_df = study.trials_dataframe()
         trials_file = os.path.join(RESULTS_DIR, 'all_trials.csv')
         trials_df.to_csv(trials_file, index=False)
         logger.info(f"所有试验结果已保存到: {trials_file}")
-        return
-
-    # ===== 旧路径：Optuna 单 fidelity（已废弃，仅向后兼容）=====
-    logger.warning("⚠️  使用旧 Optuna 路径，存在简化训练 vs 完整训练偏差问题。"
-                   "推荐 --engine raytune（见 docs/AUTOML_FRAMEWORK_SELECTION.md）")
-    study = optuna.create_study(
-        study_name=args.study_name,
-        direction='maximize',
-        pruner=optuna.pruners.MedianPruner()
-    )
-    study.optimize(
-        lambda trial: objective(trial, train_df, val_df),
-        n_trials=args.trials,
-        show_progress_bar=True
-    )
-
-    logger.info("=" * 60)
-    logger.info("优化完成!")
-    logger.info(f"最佳收益率: {study.best_value * 100:.2f}%")
-    logger.info(f"最佳参数:")
-    for key, value in study.best_params.items():
-        logger.info(f"  {key}: {value}")
-
-    # 保存最佳参数到 ParamStore（Redis 后端，统一参数管理）
-    # 父项目 pkg.params 路径已挂载在 PYTHONPATH 中
-    try:
-        from pkg.params import get_store
-        store = get_store()
-        updates = {
-            f'finrl_deepseek.{k}': v
-            for k, v in study.best_params.items()
-        }
-        store.update_batch(updates, source='optuna_legacy', performance=study.best_value)
-        logger.info(
-            f"最佳参数已写入 ParamStore (namespace=finrl_deepseek, "
-            f"{len(updates)} 个参数, best_value={study.best_value:.4f})"
-        )
-    except ImportError:
-        logger.error(
-            "无法导入 pkg.params，请确认父项目 PYTHONPATH 正确（K8s 已通过镜像 build 挂载）"
-        )
-        raise
-
-    trials_df = study.trials_dataframe()
-    trials_file = os.path.join(RESULTS_DIR, 'all_trials.csv')
-    trials_df.to_csv(trials_file, index=False)
-    logger.info(f"所有试验结果已保存到: {trials_file}")
 
 
 if __name__ == '__main__':
