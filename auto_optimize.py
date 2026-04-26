@@ -500,15 +500,25 @@ def main():
     for key, value in study.best_params.items():
         logger.info(f"  {key}: {value}")
 
-    # 保存最佳参数
-    best_params_file = os.path.join(RESULTS_DIR, 'best_params.json')
-    with open(best_params_file, 'w') as f:
-        json.dump({
-            'best_value': study.best_value,
-            'best_params': study.best_params,
-            'timestamp': datetime.now().isoformat()
-        }, f, indent=2)
-    logger.info(f"最佳参数已保存到: {best_params_file}")
+    # 保存最佳参数到 ParamStore（Redis 后端，统一参数管理）
+    # 父项目 pkg.params 路径已挂载在 PYTHONPATH 中
+    try:
+        from pkg.params import get_store
+        store = get_store()
+        updates = {
+            f'finrl_deepseek.{k}': v
+            for k, v in study.best_params.items()
+        }
+        store.update_batch(updates, source='optuna', performance=study.best_value)
+        logger.info(
+            f"最佳参数已写入 ParamStore (namespace=finrl_deepseek, "
+            f"{len(updates)} 个参数, best_value={study.best_value:.4f})"
+        )
+    except ImportError:
+        logger.error(
+            "无法导入 pkg.params，请确认父项目 PYTHONPATH 正确（K8s 已通过镜像 build 挂载）"
+        )
+        raise
 
     # 保存所有试验结果
     trials_df = study.trials_dataframe()
