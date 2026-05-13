@@ -689,11 +689,39 @@ def main():
         # ===== 旧路径：Optuna 单 fidelity（已废弃，仅向后兼容）=====
         logger.warning("⚠️  使用旧 Optuna 路径，存在简化训练 vs 完整训练偏差问题。"
                        "推荐 --engine raytune（见 docs/AUTOML_FRAMEWORK_SELECTION.md）")
+        # 跨 run 持久化 + warm-start enqueue（参考 auto_retrain.py:379-409）
+        # OPTUNA_STORAGE 环境变量启用 sqlite 持久化（K8s manifest 已注入），
+        # 让历次 HPO 累积 top-K 配置作为下次起点（warm-start helper 实证 28× time-to-best）
+        study_storage = os.environ.get('OPTUNA_STORAGE') or None
+        from datetime import datetime as _dt
+        study_name_prefix = 'finrl_retrain_'
+        study_name = f'{study_name_prefix}{_dt.now().strftime("%Y%m%d_%H%M%S")}' \
+            if study_storage else args.study_name
         study = optuna.create_study(
-            study_name=args.study_name,
+            study_name=study_name,
+            storage=study_storage,
             direction='maximize',
-            pruner=optuna.pruners.MedianPruner()
+            pruner=optuna.pruners.MedianPruner(),
+            load_if_exists=True,
         )
+        # warm-start: 跨 run 累积 transfer learning（详见 docs/ab_results/warm_start_validation.md）
+        if study_storage:
+            try:
+                from pkg.params.auto_optimizer import AutoOptimizer
+                _opt = AutoOptimizer(study_storage=study_storage)
+                warm_points = _opt.load_warm_start_points(
+                    'finrl_deepseek', top_k=3,
+                    study_name_prefix=study_name_prefix,
+                )
+                for wp in warm_points:
+                    study.enqueue_trial(wp, skip_if_exists=True)
+                if warm_points:
+                    logger.info(
+                        f"warm-start: 从历史 study 取 {len(warm_points)} 个 top points 作为先验"
+                    )
+            except Exception as exc:
+                logger.warning(f"warm-start 加载失败 (non-fatal): {exc}")
+
         study.optimize(
             lambda trial: objective(trial, train_df, val_df),
             n_trials=args.trials,
