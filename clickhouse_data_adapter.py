@@ -172,7 +172,8 @@ def load_training_data(
     end_date: Optional[str] = None,
     test_ratio: float = 0.2,
     symbols: Optional[List[str]] = None,
-    lookback_days: Optional[int] = None
+    lookback_days: Optional[int] = None,
+    samples: Optional[int] = None
 ) -> Tuple[pd.DataFrame, pd.DataFrame]:
     """从 ClickHouse 加载训练和测试数据
 
@@ -183,6 +184,7 @@ def load_training_data(
         symbols: 股票列表，默认使用 NASDAQ-100
         lookback_days: 回溯天数 (与 start_date 二选一，优先级更高)
                       例如: lookback_days=365*3 表示使用最近3年数据
+        samples: 最小化测试: 限制总数据行数
 
     Returns:
         train_df, test_df: 训练和测试数据
@@ -283,6 +285,15 @@ def load_training_data(
         test_df = df[df['date'] >= split_date].reset_index(drop=True)
 
     logger.info(f"训练集: {len(train_df)} 行, 测试集: {len(test_df)} 行")
+
+    # samples 限制（最小化测试模式）
+    if samples is not None and len(train_df) > 0:
+        test_rows = max(1, int(samples * test_ratio)) if test_ratio > 0 else 1
+        train_rows = max(1, samples - test_rows)
+        train_df = train_df.head(train_rows).reset_index(drop=True)
+        test_df = test_df.head(test_rows).reset_index(drop=True) if len(test_df) > 0 else test_df
+        logger.info(f"样本限制: 训练集={len(train_df)} 行, 测试集={len(test_df)} 行")
+
     return train_df, test_df
 
 
