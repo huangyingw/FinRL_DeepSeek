@@ -241,6 +241,12 @@ def train_and_evaluate(
     no_improve_count = 0
     early_stop_patience = 10
 
+    # Diagnostic: do-nothing / value-collapse 排查
+    # 详见 docs/decisions/2026-05-18-finrl-deepseek-rl-instrumentation.md
+    _diag_ev: list = []
+    _diag_act_mean_abs: list = []
+    _diag_act_zero_frac: list = []
+
     # 训练循环
     for epoch in range(epochs):
         obs, _ = train_env.reset()
@@ -328,6 +334,18 @@ def train_and_evaluate(
         # 学习率退火
         pi_scheduler.step()
         vf_scheduler.step()
+
+        # Diagnostic: 每 epoch 末记录 explained_variance + action 分布统计
+        with torch.no_grad():
+            _final_v = critic(obs_tensor).detach().cpu().numpy()
+        _ret_np = ret_tensor.detach().cpu().numpy()
+        _ret_var = float(_ret_np.var())
+        _residual_var = float((_ret_np - _final_v).var())
+        _ev = 1.0 - _residual_var / (_ret_var + 1e-8)
+        _act_np = act_tensor.detach().cpu().numpy()
+        _diag_ev.append(_ev)
+        _diag_act_mean_abs.append(float(np.abs(_act_np).mean()))
+        _diag_act_zero_frac.append(float((np.abs(_act_np) < 0.01).mean()))
 
         # 每 5 epochs 在验证集上评估
         if epoch % 5 == 0 or epoch == epochs - 1:
@@ -438,6 +456,15 @@ def train_and_evaluate(
                 "sharpe": sharpe,
                 "max_drawdown": max_dd,
             })
+            # Diagnostic 汇总（last 10 epoch 平均，比 final 单点更稳健）
+            if _diag_ev:
+                _tail = slice(-10, None) if len(_diag_ev) >= 10 else slice(None)
+                _mlrun.log_metrics({
+                    "diag_ev_tail_avg": float(np.mean(_diag_ev[_tail])),
+                    "diag_ev_final": float(_diag_ev[-1]),
+                    "diag_act_mean_abs_tail_avg": float(np.mean(_diag_act_mean_abs[_tail])),
+                    "diag_act_zero_frac_tail_avg": float(np.mean(_diag_act_zero_frac[_tail])),
+                })
     except Exception as _e:
         logger.debug(f"MLflow trial 记录跳过: {_e}")
 

@@ -423,6 +423,16 @@ def cppo(env_fn,
     logger.setup_pytorch_saver(ac)
 
     def update():
+        # Diagnostic: do-nothing / value-collapse 排查（不改训练数学，仅记录）
+        # 详见 docs/decisions/2026-05-18-finrl-deepseek-rl-instrumentation.md
+        _act_raw = buf.act_buf.copy()
+        _ret_var = float(buf.ret_buf.var())
+        _residual_var = float((buf.ret_buf - buf.val_buf).var())
+        _ev = 1.0 - _residual_var / (_ret_var + 1e-8)
+        _act_mean_abs = float(np.abs(_act_raw).mean())
+        _act_zero_frac = float((np.abs(_act_raw) < 0.01).mean())
+        logger.store(ExplainedVar=_ev, ActMeanAbs=_act_mean_abs, ActZeroFrac=_act_zero_frac)
+
         data = buf.get()
 
         pi_l_old, pi_info_old = compute_loss_pi(data)
@@ -549,6 +559,9 @@ def cppo(env_fn,
         logger.log_tabular('KL', average_only=True)
         logger.log_tabular('ClipFrac', average_only=True)
         logger.log_tabular('StopIter', average_only=True)
+        logger.log_tabular('ExplainedVar', average_only=True)
+        logger.log_tabular('ActMeanAbs', average_only=True)
+        logger.log_tabular('ActZeroFrac', average_only=True)
         logger.log_tabular('Time', time.time() - start_time)
         logger.dump_tabular()
 
