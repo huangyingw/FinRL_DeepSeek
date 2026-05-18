@@ -581,44 +581,41 @@ if __name__ == "__main__":
     print(f"Starting CPPO-DeepSeek training with {epochs} epochs...")
     print(f"Hyperparameters loaded from environment variables")
 
-    # MLflow 实验跟踪（详见 pkg/mlops/mlflow_client.py）
-    # 失败不阻塞训练；HPO trial 走 auto_optimize.py 内部的 nested run
-    try:
-        from pkg.mlops import log_run
-        _mlflow_ctx = log_run(
-            experiment="finrl_deepseek",
-            run_name=f"{args.exp_name}_seed{args.seed}",
-            tags={"entry": "standalone_trainer", "epochs": str(epochs)},
-        )
-    except Exception as _e:
-        print(f"⚠️ MLflow 不可用，跳过实验跟踪: {_e}")
-        from contextlib import nullcontext
-        _mlflow_ctx = nullcontext()
+    # 实验记录：MLflow + ParamStore 双层 fail-fast（automl-self-evolving 5/18 交接）
+    # 记录失败必须阻塞训练完成：训练成果不可追溯 = 价值归零。
+    # 详见 docs/decisions/2026-05-18-finrl-deepseek-experiment-tracking.md
+    from pkg.mlops import log_run
+    from pkg.params import update as _ps_update
+    from datetime import datetime as _dt
 
-    with _mlflow_ctx as _mlrun:
-        # 记录 hyperparams
-        if _mlrun is not None:
-            try:
-                _mlrun.log_params({k: v for k, v in BEST_PARAMS.items() if isinstance(v, (int, float, str, bool))})
-                _mlrun.log_params({"epochs": epochs, "seed": args.seed})
-            except Exception as _e:
-                print(f"⚠️ MLflow log_params 失败: {_e}")
+    _ts = _dt.now()
+    with log_run(
+        experiment="finrl_deepseek",
+        run_name=f"{args.exp_name}_seed{args.seed}_{_ts.strftime('%Y%m%d_%H%M%S')}",
+        tags={"entry": "standalone_trainer", "epochs": str(epochs)},
+    ) as _mlrun:
+        _mlrun.log_params({k: v for k, v in BEST_PARAMS.items() if isinstance(v, (int, float, str, bool))})
+        _mlrun.log_params({"epochs": epochs, "seed": args.seed})
 
         trained_cppo = cppo(lambda: env_train, actor_critic=MLPActorCritic,
                             seed=args.seed, logger_kwargs=logger_kwargs)
 
-        # Save the model
         model_path = TRAINED_MODEL_DIR + f"/agent_cppo_deepseek_{epochs}_epochs.pth"
         torch.save(trained_cppo.state_dict(), model_path)
         print("Training finished and saved in " + model_path)
 
-        # MLflow 上传 artifact + 注册（best_model.pth 由训练循环已保存）
-        if _mlrun is not None:
-            try:
-                _mlrun.log_artifact(model_path, artifact_path="model")
-                best_model_path = TRAINED_MODEL_DIR + "/best_model.pth"
-                if os.path.exists(best_model_path):
-                    _mlrun.log_artifact(best_model_path, artifact_path="model")
-                print(f"✅ MLflow run_id={_mlrun.run_id} 已记录")
-            except Exception as _e:
-                print(f"⚠️ MLflow log_artifact 失败: {_e}")
+        _mlrun.log_artifact(model_path, artifact_path="model")
+        best_model_path = TRAINED_MODEL_DIR + "/best_model.pth"
+        if os.path.exists(best_model_path):
+            _mlrun.log_artifact(best_model_path, artifact_path="model")
+        print(f"✅ MLflow run_id={_mlrun.run_id} 已记录")
+
+        # ParamStore 5 keys（任意 update 失败也直接 raise）
+        _ps_source = f"standalone_trainer|mlflow:{_mlrun.run_id}"
+        _ps_update('finrl_deepseek.last_train_ts', _ts.isoformat(), source=_ps_source)
+        _ps_update('finrl_deepseek.last_data_source',
+                   os.environ.get('DATA_SOURCE', 'clickhouse'), source=_ps_source)
+        _ps_update('finrl_deepseek.last_epochs', int(epochs), source=_ps_source)
+        _ps_update('finrl_deepseek.last_model_path', str(model_path), source=_ps_source)
+        _ps_update('finrl_deepseek.last_mlflow_run_id', str(_mlrun.run_id), source=_ps_source)
+        print("✅ ParamStore 已写入 finrl_deepseek.last_* (5 keys)")
