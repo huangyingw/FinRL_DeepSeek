@@ -561,31 +561,20 @@ def raytune_train_and_evaluate(config: dict, train_df: pd.DataFrame, val_df: pd.
     params['initial_amount'] = 1000000
     params['trial_name'] = f"ray_{int(time.time())}"
 
-    # Ray Tune Checkpoint API（Ray 2.x: ray.train.report + Checkpoint.from_directory）
+    # Ray 2.x checkpoint API（强制：Ray 1.x tune.report 不支持 checkpoint kwarg，
+    # fallback 会 silent-degrade 失去 best_trial.checkpoint，违反 fail-fast 原则）
     # 详见 docs/decisions/2026-05-18-finrl-deepseek-ray-tune-checkpoint-persistence.md
-    try:
-        from ray import train as _ray_train
-        from ray.train import Checkpoint
-        _new_api = True
-    except ImportError:
-        from ray import tune as _ray_train  # type: ignore
-        Checkpoint = None  # type: ignore
-        _new_api = False
+    from ray import train as _ray_train
+    from ray.train import Checkpoint
 
     try:
         with tempfile.TemporaryDirectory() as _ckpt_dir:
             score = train_and_evaluate(train_df, val_df, _checkpoint_dir=_ckpt_dir, **params)
-            if _new_api and Checkpoint is not None:
-                _ray_train.report({'score': score, 'epochs': epochs},
-                                  checkpoint=Checkpoint.from_directory(_ckpt_dir))
-            else:
-                _ray_train.report({'score': score, 'epochs': epochs})
+            _ray_train.report({'score': score, 'epochs': epochs},
+                              checkpoint=Checkpoint.from_directory(_ckpt_dir))
     except Exception as e:
         logger.error(f"Ray Tune trial failed: {e}")
-        if _new_api:
-            _ray_train.report({'score': -1.0, 'epochs': epochs})
-        else:
-            _ray_train.report({'score': -1.0, 'epochs': epochs})
+        _ray_train.report({'score': -1.0, 'epochs': epochs})
 
 
 def build_raytune_search_space() -> dict:
