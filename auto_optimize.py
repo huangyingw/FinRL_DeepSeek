@@ -143,9 +143,14 @@ def train_and_evaluate(
     trial_name: str,
     ent_coef: float = 0.01,
     weight_decay: float = 1e-5,
+    _checkpoint_dir: str = None,
     **kwargs,
 ) -> float:
-    """训练模型并返回验证集收益率"""
+    """训练模型并返回验证集收益率
+
+    _checkpoint_dir: 可选，训练完成后把 (验证集早停恢复后的) actor/critic state_dict
+    + 训练 config 写入该目录。供 Ray Tune trainable 调 train.report(checkpoint=...) 持久化。
+    """
     import warnings
     warnings.filterwarnings('ignore')
 
@@ -395,6 +400,30 @@ def train_and_evaluate(
         actor.load_state_dict(best_actor_state)
         critic.load_state_dict(best_critic_state)
 
+    # Checkpoint 持久化（Ray Tune trainable 触发）—— 写入验证集早停恢复后的 best weights
+    # 详见 docs/decisions/2026-05-18-finrl-deepseek-ray-tune-checkpoint-persistence.md
+    if _checkpoint_dir is not None:
+        import os, json
+        os.makedirs(_checkpoint_dir, exist_ok=True)
+        torch.save(actor.state_dict(), os.path.join(_checkpoint_dir, 'actor.pt'))
+        torch.save(critic.state_dict(), os.path.join(_checkpoint_dir, 'critic.pt'))
+        _meta = {
+            'trial_name': trial_name,
+            'best_val_score': float(best_val_score),
+            'epochs_trained': int(epoch + 1),
+            'config': {
+                'epochs': epochs, 'gamma': gamma, 'clip_ratio': clip_ratio,
+                'pi_lr': pi_lr, 'vf_lr': vf_lr,
+                'train_pi_iters': train_pi_iters, 'train_v_iters': train_v_iters,
+                'lam': lam, 'target_kl': target_kl, 'hmax': hmax,
+                'reward_scaling': reward_scaling,
+                'hidden_sizes': list(hidden_sizes),
+                'ent_coef': ent_coef, 'weight_decay': weight_decay,
+            },
+        }
+        with open(os.path.join(_checkpoint_dir, 'meta.json'), 'w') as _f:
+            json.dump(_meta, _f, indent=2)
+
     # 验证集最终评估
     obs, _ = val_env.reset()
     obs = np.asarray(obs, dtype=np.float32)
@@ -518,9 +547,9 @@ def objective(trial: Trial, train_df: pd.DataFrame, val_df: pd.DataFrame) -> flo
 # ============================================================
 
 def raytune_train_and_evaluate(config: dict, train_df: pd.DataFrame, val_df: pd.DataFrame):
-    """Ray Tune trainable: 接收 config dict，每个 epoch 报告 metric 给 ASHA"""
-    from ray import tune
+    """Ray Tune trainable: 接收 config dict，训练完报告 score 给 ASHA 并持久化 checkpoint"""
     import time
+    import tempfile
 
     # config 包含完整搜索空间 + ASHA 注入的 max_epoch（fidelity）
     params = dict(config)
@@ -532,13 +561,31 @@ def raytune_train_and_evaluate(config: dict, train_df: pd.DataFrame, val_df: pd.
     params['initial_amount'] = 1000000
     params['trial_name'] = f"ray_{int(time.time())}"
 
+    # Ray Tune Checkpoint API（Ray 2.x: ray.train.report + Checkpoint.from_directory）
+    # 详见 docs/decisions/2026-05-18-finrl-deepseek-ray-tune-checkpoint-persistence.md
     try:
-        score = train_and_evaluate(train_df, val_df, **params)
-        # 单点 report；ASHA 已内置 epoch 维度的 fidelity 推进
-        tune.report({'score': score, 'epochs': epochs})
+        from ray import train as _ray_train
+        from ray.train import Checkpoint
+        _new_api = True
+    except ImportError:
+        from ray import tune as _ray_train  # type: ignore
+        Checkpoint = None  # type: ignore
+        _new_api = False
+
+    try:
+        with tempfile.TemporaryDirectory() as _ckpt_dir:
+            score = train_and_evaluate(train_df, val_df, _checkpoint_dir=_ckpt_dir, **params)
+            if _new_api and Checkpoint is not None:
+                _ray_train.report({'score': score, 'epochs': epochs},
+                                  checkpoint=Checkpoint.from_directory(_ckpt_dir))
+            else:
+                _ray_train.report({'score': score, 'epochs': epochs})
     except Exception as e:
         logger.error(f"Ray Tune trial failed: {e}")
-        tune.report({'score': -1.0, 'epochs': epochs})
+        if _new_api:
+            _ray_train.report({'score': -1.0, 'epochs': epochs})
+        else:
+            _ray_train.report({'score': -1.0, 'epochs': epochs})
 
 
 def build_raytune_search_space() -> dict:
@@ -611,6 +658,12 @@ def raytune_run(train_df, val_df, n_trials: int, max_concurrent: int = 1):
         reduction_factor=3,  # 每轮淘汰 2/3
     )
 
+    # Checkpoint 持久化：写入 PVC（trading-models 挂载点 /app/models），
+    # HPO 跑完可从 best_trial.checkpoint.path 提取 best weights。
+    # checkpoint_score_attr='score' + keep_checkpoints_num=1 → 每 trial 仅留最优。
+    ray_results_dir = os.environ.get('RAY_RESULTS_DIR',
+                                     '/app/models/finrl-deepseek/ray_results')
+    os.makedirs(ray_results_dir, exist_ok=True)
     trainable = partial(raytune_train_and_evaluate, train_df=train_df, val_df=val_df)
     analysis = tune.run(
         trainable,
@@ -619,6 +672,9 @@ def raytune_run(train_df, val_df, n_trials: int, max_concurrent: int = 1):
         search_alg=optuna_search,
         scheduler=asha,
         max_concurrent_trials=max_concurrent,
+        local_dir=ray_results_dir,
+        keep_checkpoints_num=1,
+        checkpoint_score_attr='score',
         verbose=1,
     )
     return analysis
@@ -705,6 +761,40 @@ def main():
                     "无法导入 pkg.params，请确认父项目 PYTHONPATH 正确（K8s 已通过镜像 build 挂载）"
                 )
                 raise
+
+            # 提取 best trial checkpoint → 复制到稳定路径 + 上传 MLflow + 写 ParamStore
+            # 详见 docs/decisions/2026-05-18-finrl-deepseek-ray-tune-checkpoint-persistence.md
+            best_ckpt_obj = getattr(best_trial, 'checkpoint', None)
+            if best_ckpt_obj is not None and getattr(best_ckpt_obj, 'path', None):
+                import shutil, datetime
+                _src = best_ckpt_obj.path
+                _ts = datetime.datetime.now().strftime('%Y%m%d_%H%M%S')
+                _dst_root = os.environ.get(
+                    'BEST_TRIAL_CHECKPOINT_DIR',
+                    '/app/models/finrl-deepseek/finrl_deepseek/best_trial')
+                _dst = os.path.join(_dst_root, f'best_trial_{_ts}')
+                os.makedirs(os.path.dirname(_dst), exist_ok=True)
+                shutil.copytree(_src, _dst, dirs_exist_ok=True)
+                logger.info(f"Best trial checkpoint 复制: {_src} → {_dst}")
+
+                if _hpo_run is not None:
+                    _hpo_run.log_artifact(_dst, artifact_path='best_trial')
+
+                try:
+                    store.update_batch({
+                        'finrl_deepseek.best_trial_checkpoint_path': _dst,
+                        'finrl_deepseek.best_trial_score': float(best_value),
+                        'finrl_deepseek.best_trial_ts': _ts,
+                    }, source=mlflow_source, performance=best_value)
+                    logger.info("Best trial checkpoint 路径已写入 ParamStore")
+                except Exception as _e:
+                    logger.error(f"ParamStore checkpoint 路径写入失败: {_e}")
+                    raise
+            else:
+                logger.warning(
+                    "best_trial 无 checkpoint —— Ray Tune checkpoint config 可能未生效。"
+                    "请确认 raytune_train_and_evaluate 调 train.report(checkpoint=...)"
+                )
 
             # 保存所有 trial 结果（仅作为审计/调试用途）
             trials_df = analysis.dataframe()
