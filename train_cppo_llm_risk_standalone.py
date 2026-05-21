@@ -586,6 +586,13 @@ if __name__ == "__main__":
 
     args = parser.parse_args()
 
+    # 训练前清理 PVC 上无 .meta.json sidecar 的孤儿 ckpt（隔离到 quarantine/）
+    # 详见 docs/decisions/2026-05-21-checkpoint-compatibility-protocol.md
+    from pkg.mlops.checkpoint import quarantine_orphan_checkpoints
+    _orphans = quarantine_orphan_checkpoints(TRAINED_MODEL_DIR, pattern='*.pth')
+    if _orphans:
+        print(f"⚠ Quarantined {len(_orphans)} orphan ckpt(s): {_orphans}")
+
     from spinup.utils.run_utils import setup_logger_kwargs
     logger_kwargs = setup_logger_kwargs(args.exp_name, args.seed)
 
