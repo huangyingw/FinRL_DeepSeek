@@ -649,7 +649,9 @@ def raytune_run(train_df, val_df, n_trials: int, max_concurrent: int = 1):
 
     # Checkpoint 持久化：写入 PVC（trading-models 挂载点 /app/models），
     # HPO 跑完可从 best_trial.checkpoint.path 提取 best weights。
-    # checkpoint_score_attr='score' + keep_checkpoints_num=1 → 每 trial 仅留最优。
+    # Ray 2.x: tune.run 接受 storage_path（替代 deprecated local_dir）。
+    # 每 trial 在 raytune_train_and_evaluate 末尾仅 report 1 次 checkpoint，
+    # 不会有 multi-checkpoint 累积，无需配 checkpoint_config（默认行为已满足）。
     ray_results_dir = os.environ.get('RAY_RESULTS_DIR',
                                      '/app/models/finrl-deepseek/ray_results')
     os.makedirs(ray_results_dir, exist_ok=True)
@@ -661,9 +663,7 @@ def raytune_run(train_df, val_df, n_trials: int, max_concurrent: int = 1):
         search_alg=optuna_search,
         scheduler=asha,
         max_concurrent_trials=max_concurrent,
-        local_dir=ray_results_dir,
-        keep_checkpoints_num=1,
-        checkpoint_score_attr='score',
+        storage_path=ray_results_dir,
         verbose=1,
     )
     return analysis
