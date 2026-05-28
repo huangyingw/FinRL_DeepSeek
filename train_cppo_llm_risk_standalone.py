@@ -483,10 +483,12 @@ def cppo(env_fn,
             ep_ret += r
             ep_len += 1
 
-            llm_risks = np.array(next_o[0, -stock_dimension:])
+            # llm_risks 已被 env._normalize_state 归一化除以 5，反归一化回 {1,2,3,4,5} 并 clamp 到有效范围
+            llm_risks_normed = np.array(next_o[0, -stock_dimension:])
+            llm_risks = np.clip(np.round(llm_risks_normed * 5).astype(int), 1, 5)
 
             risk_to_weight = {1: 0.99, 2: 0.995, 3: 1.0, 4: 1.005, 5: 1.01}
-            llm_risks_weights = np.vectorize(risk_to_weight.get)(llm_risks)
+            llm_risks_weights = np.vectorize(lambda x: risk_to_weight.get(x, 1.0))(llm_risks)
 
             prices = np.array(next_o[0, 1:stock_dimension+1])
             shares = np.array(next_o[0, stock_dimension+1:stock_dimension*2+1])
