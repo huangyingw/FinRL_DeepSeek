@@ -82,11 +82,16 @@ def run_arm(train_df, val_df, *, use_llm_risk_cvar, seed, epochs):
 
     hp = dict(SHARED_HP)
     hp['epochs'] = epochs
+    # hmax 是 env 参数（非算法参数）：单独 pop 给 build_env，不进 cppo_train
+    hmax = hp.pop('hmax')
+    reward_scaling = 6.0879465081638936e-05
 
+    # 训练用 DummyVecEnv（CVaR rollout 靠 next_o[0,...] 取值）；
+    # 评估用 raw env（evaluate_oos 读 raw_env.state / raw_env.stock_dim）
     train_vec, stock_dim = cppo_core.build_env(
-        train_df, hmax=hp['hmax'], reward_scaling=6.0879465081638936e-05, vec=True)
+        train_df, hmax=hmax, reward_scaling=reward_scaling, vec=True)
     val_env, _ = cppo_core.build_env(
-        val_df, hmax=hp['hmax'], reward_scaling=6.0879465081638936e-05, vec=False)
+        val_df, hmax=hmax, reward_scaling=reward_scaling, vec=False)
 
     _, metrics = cppo_core.cppo_train(
         lambda: train_vec,
