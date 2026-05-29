@@ -520,7 +520,11 @@ def cppo_train(env_fn,
         # 跨期 OOS 评估 + 早停（仅 HPO 路径传入 val_env 时启用）
         if val_env is not None and (epoch % eval_every == 0 or epoch == epochs - 1):
             m = evaluate_oos(ac, val_env, initial_amount=initial_amount)
-            logger.store(ValScore=m['score'], ValSharpe=m['sharpe'])
+            # 注：不走 logger.log_tabular（它要求每 epoch 都 store，否则空列表
+            # IndexError），评估非每 epoch 触发，直接 print
+            logger.log(f'[epoch {epoch}] OOS score={m["score"]:.4f} '
+                       f'sharpe={m["sharpe"]:.3f} ret={m["total_return"]:.4f} '
+                       f'maxdd={m["max_dd"]:.4f}')
             if m['score'] > best_val_score:
                 best_val_score = m['score']
                 best_metrics = m
@@ -542,8 +546,6 @@ def cppo_train(env_fn,
         logger.log_tabular('ExplainedVar', average_only=True)
         logger.log_tabular('ActMeanAbs', average_only=True)
         logger.log_tabular('ActZeroFrac', average_only=True)
-        if val_env is not None:
-            logger.log_tabular('ValScore', average_only=True)
         logger.log_tabular('Time', time.time() - start_time)
         logger.dump_tabular()
 
