@@ -142,18 +142,49 @@ def main():
     off = run_arm(train_df, val_df, use_llm_risk_cvar=False, seed=args.seed, epochs=args.epochs)
 
     delta = on['score'] - off['score']
-    logger.info("=" * 60)
+    logger.info("=" * 64)
     logger.info("消融结果对照（OOS held-out，同 split/超参/seed）")
-    logger.info("-" * 60)
-    logger.info(f"{'metric':<16}{'ON(CVaR)':>14}{'OFF(vanilla)':>16}{'Δ(ON-OFF)':>14}")
-    for k in ('score', 'sharpe', 'total_return', 'max_dd'):
-        logger.info(f"{k:<16}{on[k]:>14.4f}{off[k]:>16.4f}{on[k]-off[k]:>14.4f}")
-    logger.info("-" * 60)
+    logger.info("-" * 64)
+    logger.info(f"{'metric':<20}{'ON(CVaR)':>14}{'OFF(vanilla)':>16}{'Δ(ON-OFF)':>14}")
+    for k in ('score', 'sharpe', 'total_return', 'max_dd',
+              'information_ratio', 'bench_total_return', 'excess_return'):
+        logger.info(f"{k:<20}{on[k]:>14.4f}{off[k]:>16.4f}{on[k]-off[k]:>14.4f}")
+    logger.info("-" * 64)
+
+    # 分年 IR（特别看 2022 熊市——论文称 CPPO-DeepSeek 熊市更优）
+    logger.info("分年 Information Ratio（剥离 beta 的 alpha；2022=熊市）:")
+    years = sorted(set(on['ir_by_year']) | set(off['ir_by_year']))
+    logger.info(f"{'year':<20}{'ON(CVaR)':>14}{'OFF(vanilla)':>16}{'Δ':>14}")
+    for y in years:
+        o = on['ir_by_year'].get(y, 0.0)
+        f = off['ir_by_year'].get(y, 0.0)
+        tag = "  ← 熊市" if y == '2022' else ""
+        logger.info(f"{y:<20}{o:>14.4f}{f:>16.4f}{o - f:>14.4f}{tag}")
+    logger.info("-" * 64)
+
+    # 判读 1：llm_risk 是否有 OOS 贡献（复合 score）
     verdict = ("LLM-risk 信号有正向 OOS 贡献" if delta > 0.02 else
                "LLM-risk 信号无显著 OOS 贡献（噪声/退化）" if abs(delta) <= 0.02 else
                "LLM-risk 信号 OOS 为负（有害）")
-    logger.info(f"判读: Δscore={delta:+.4f} → {verdict}")
-    logger.info("=" * 60)
+    logger.info(f"判读1(llm_risk): Δscore={delta:+.4f} → {verdict}")
+
+    # 判读 2：是否产出 alpha（IR>0 且跑赢基准），还是只是 beta
+    on_ir, on_exc = on['information_ratio'], on['excess_return']
+    if on_ir > 0.05 and on_exc > 0:
+        alpha_verdict = f"产出正 alpha（IR={on_ir:.4f}>0 且跑赢大盘 {on_exc:+.2%}）→ 值得深究"
+    elif on_ir <= 0.05 and on_exc <= 0:
+        alpha_verdict = (f"是 beta 非 alpha（IR={on_ir:.4f}≈0 且未跑赢大盘 {on_exc:+.2%}）→ 不投产")
+    else:
+        alpha_verdict = (f"边缘（IR={on_ir:.4f}, 超额={on_exc:+.2%}）→ 看熊市段 IR_2022={on['ir_bear_2022']:+.4f}")
+    logger.info(f"判读2(alpha vs beta): {alpha_verdict}")
+
+    # 判读 3：熊市抗跌价值（论文唯一站得住的卖点）
+    on_bear, off_bear = on['ir_bear_2022'], off['ir_bear_2022']
+    bear_verdict = ("CPPO-DeepSeek 熊市抗跌有价值（2022 IR 显著高于 vanilla）→ 可作防御腿"
+                    if on_bear - off_bear > 0.05 and on_bear > 0 else
+                    "熊市段 llm_risk 无显著抗跌优势 → 论文卖点未复现")
+    logger.info(f"判读3(熊市抗跌): ON 2022 IR={on_bear:+.4f} vs OFF {off_bear:+.4f} → {bear_verdict}")
+    logger.info("=" * 64)
 
     # 写 ParamStore 供追溯（fail-fast：写失败直接 raise）
     try:

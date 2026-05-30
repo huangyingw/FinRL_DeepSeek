@@ -237,16 +237,35 @@ class CPPOBuffer:
 # ============================================================
 # OOS 评估（搬自 auto_optimize 的 val 评估逻辑，中立脚手架）
 # ============================================================
+def _information_ratio(port_ret, bench_ret):
+    """Information Ratio = 年化(超额收益均值 / 跟踪误差)。
+
+    剥离 beta、只衡量 alpha——这是 FinRL-DeepSeek 论文报告的核心指标（非 Sharpe）。
+    详见 feedback_reproduce_paper_strategy_checklist：测错指标=测错维度。
+    """
+    active = np.asarray(port_ret) - np.asarray(bench_ret)
+    if len(active) < 2 or active.std() == 0:
+        return 0.0
+    return float(active.mean() / active.std() * (252 ** 0.5))
+
+
 def evaluate_oos(ac, raw_env, initial_amount=1000000):
     """在 held-out raw env 上确定性评估，返回 OOS 指标。
 
     与训练用的 DummyVecEnv 不同，这里用未包装的 StockTradingEnv，obs 为 1D。
-    复合 score 与 auto_optimize 一致：0.3*sharpe + 0.3*total_return - 0.4*max_dd
+    复合 score（早停用）：0.3*sharpe + 0.3*total_return - 0.4*max_dd
+
+    新增（对齐 FinRL-DeepSeek 论文口径，2026-05-30）：
+    - information_ratio: vs equal-weight buy&hold 基准，剥离 beta 衡量 alpha
+    - bench_total_return / excess_return: 策略 vs 大盘，判 beta-非-alpha
+    - ir_by_year / ir_bear_2022: 分年 IR，单独看熊市段（论文称 CPPO-DeepSeek 熊市更优）
     """
     obs, _ = raw_env.reset()
     obs = np.asarray(obs, dtype=np.float32)
     done = False
     portfolio_values = [initial_amount]
+    price_vecs = []   # 每步全标的价格向量（算 equal-weight buy&hold 基准）
+    step_dates = []   # 每步日期（分年/熊市切段）
 
     while not done:
         obs_tensor = torch.as_tensor(obs, dtype=torch.float32, device=DEVICE)
@@ -258,6 +277,11 @@ def evaluate_oos(ac, raw_env, initial_amount=1000000):
         sd = raw_env.stock_dim
         pv = s[0] + sum(s[1 + i] * s[1 + sd + i] for i in range(sd))
         portfolio_values.append(pv)
+        price_vecs.append(np.array(s[1:1 + sd], dtype=np.float64))
+        try:
+            step_dates.append(raw_env._get_date())
+        except Exception:
+            step_dates.append(None)
 
     final_value = portfolio_values[-1]
     total_return = (final_value - initial_amount) / initial_amount
@@ -273,12 +297,60 @@ def evaluate_oos(ac, raw_env, initial_amount=1000000):
     max_dd = abs(drawdown) if not pd.isna(drawdown) else 0.0
     score = 0.3 * sharpe + 0.3 * total_return - 0.4 * max_dd
 
+    # ---- equal-weight buy&hold 基准（同标的同期，纯 beta）----
+    bench_total_return = 0.0
+    information_ratio = 0.0
+    excess_return = 0.0
+    ir_by_year = {}
+    ir_bear_2022 = 0.0
+    if len(price_vecs) >= 2:
+        prices = np.vstack(price_vecs)                  # [T, sd]
+        p0 = prices[0].copy()
+        valid = p0 > 0                                  # 屏蔽缺数据(价=0)的标的
+        if valid.sum() > 0:
+            # equal-weight buy&hold：t 时刻净值 = 初始 * 各有效标的 price_t/price_0 的均值
+            rel = np.ones((prices.shape[0], valid.sum()))
+            rel = prices[:, valid] / p0[valid]
+            bench_value = initial_amount * rel.mean(axis=1)
+            bench_series = pd.Series(bench_value)
+            bench_ret = bench_series.pct_change().dropna()
+            bench_total_return = (bench_value[-1] - initial_amount) / initial_amount
+            excess_return = total_return - bench_total_return
+
+            # 对齐 portfolio/bench 日收益（portfolio_values 比 price_vecs 多首项 initial）
+            port_ret = pv_series.pct_change().dropna().reset_index(drop=True)
+            bench_ret = bench_ret.reset_index(drop=True)
+            n = min(len(port_ret), len(bench_ret))
+            port_ret, bench_ret = port_ret[:n], bench_ret[:n]
+            information_ratio = _information_ratio(port_ret.values, bench_ret.values)
+
+            # 分年 IR（step_dates 与 price_vecs 同长，日收益对应 step 1..T-1）
+            if any(d is not None for d in step_dates):
+                years = []
+                for d in step_dates[1:1 + n]:            # 与日收益对齐
+                    try:
+                        years.append(int(str(d)[:4]))
+                    except Exception:
+                        years.append(None)
+                years = np.array(years[:n])
+                pr, br = port_ret.values[:len(years)], bench_ret.values[:len(years)]
+                for y in sorted(set(int(x) for x in years if x is not None)):
+                    m = years == y
+                    if m.sum() >= 2:
+                        ir_by_year[str(y)] = _information_ratio(pr[m], br[m])
+                ir_bear_2022 = ir_by_year.get('2022', 0.0)
+
     return {
         'score': float(score),
         'sharpe': float(sharpe),
         'total_return': float(total_return),
         'max_dd': float(max_dd),
         'final_value': float(final_value),
+        'information_ratio': float(information_ratio),
+        'bench_total_return': float(bench_total_return),
+        'excess_return': float(excess_return),
+        'ir_by_year': ir_by_year,
+        'ir_bear_2022': float(ir_bear_2022),
     }
 
 
