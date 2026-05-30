@@ -29,11 +29,28 @@ logging.basicConfig(level=logging.INFO, format='%(asctime)s %(levelname)s %(mess
 logger = logging.getLogger("ablation_llm_risk")
 
 
-def load_data_split():
-    """跨期 temporal split：早期 80% 训练 / 后期 20% OOS 验证（无 lookahead）。
+def _load_hf_csv(data_file):
+    """从 HuggingFace benstaf/nasdaq_2013_2023 加载单个 CSV，确保 llm 列存在。"""
+    from datasets import load_dataset
+    ds = load_dataset("benstaf/nasdaq_2013_2023", data_files=data_file)
+    df = pd.DataFrame(ds['train'])
+    if 'Unnamed: 0' in df.columns:
+        df = df.drop('Unnamed: 0', axis=1)
+    # 防御：某些 trade 文件可能缺 llm 列（HF viewer 报过 schema 不一致）
+    if 'llm_sentiment' not in df.columns or 'llm_risk' not in df.columns:
+        raise RuntimeError(f"{data_file} 缺 llm_sentiment/llm_risk 列 — 须用 deepseek_risk 版文件")
+    return df
 
-    与 auto_optimize.load_data 同源逻辑。DATA_SOURCE=clickhouse 时走 ClickHouse，
-    否则 HuggingFace。
+
+def load_data_split():
+    """加载训练 / OOS 验证数据。
+
+    OOS_MODE（默认 true_oos）：
+      - true_oos: 对齐原版论文——train=train_data_deepseek_risk_2013_2018.csv 全部，
+        val=trade_data_deepseek_risk_2019_2023.csv 全部（独立后续期，真样本外）。
+      - internal_split: 旧行为，2013-2018 内部 80/20 切（同分布，非真 OOS）。
+
+    DATA_SOURCE=clickhouse 时走 ClickHouse（消融不用，保留兼容）。
     """
     data_source = os.environ.get('DATA_SOURCE', 'huggingface').lower()
     if data_source == 'clickhouse':
@@ -44,17 +61,22 @@ def load_data_split():
         logger.info(f"ClickHouse: train {len(train_df)} / val {len(val_df)} 行")
         return train_df, val_df
 
-    from datasets import load_dataset
-    dataset = load_dataset("benstaf/nasdaq_2013_2023",
-                           data_files="train_data_deepseek_risk_2013_2018.csv")
-    df = pd.DataFrame(dataset['train'])
-    if 'Unnamed: 0' in df.columns:
-        df = df.drop('Unnamed: 0', axis=1)
+    oos_mode = os.environ.get('OOS_MODE', 'true_oos').lower()
+    if oos_mode == 'true_oos':
+        # 对齐原版：独立的后续期 trade 文件做 OOS（真样本外）
+        train_df = _load_hf_csv("train_data_deepseek_risk_2013_2018.csv")
+        val_df = _load_hf_csv("trade_data_deepseek_risk_2019_2023.csv")
+        logger.info(f"true_oos: train(2013-2018) {len(train_df)} / "
+                    f"val(2019-2023, 独立后续期) {len(val_df)} 行")
+        return train_df, val_df
+
+    # internal_split: 旧行为（2013-2018 内部切，同分布非真 OOS）
+    df = _load_hf_csv("train_data_deepseek_risk_2013_2018.csv")
     unique_dates = sorted(df['date'].unique())
     split_date = unique_dates[int(len(unique_dates) * 0.8)]
     train_df = df[df['date'] < split_date].reset_index(drop=True)
     val_df = df[df['date'] >= split_date].reset_index(drop=True)
-    logger.info(f"HuggingFace: train<{split_date} {len(train_df)} / val {len(val_df)} 行")
+    logger.info(f"internal_split: train<{split_date} {len(train_df)} / val {len(val_df)} 行")
     return train_df, val_df
 
 
