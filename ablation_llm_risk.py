@@ -196,7 +196,12 @@ def main():
         _ps_update('finrl_deepseek.ablation_llm_risk_off_score', float(off['score']), source=src)
         _ps_update('finrl_deepseek.ablation_llm_risk_delta', float(delta), source=src)
         _ps_update('finrl_deepseek.ablation_llm_risk_ts', ts, source=src)
-        logger.info("✅ ParamStore 已写入 ablation_llm_risk_* (4 keys)")
+        # 论文口径指标（剥离 beta 的 alpha + 熊市段）
+        _ps_update('finrl_deepseek.ablation_on_information_ratio', float(on['information_ratio']), source=src)
+        _ps_update('finrl_deepseek.ablation_on_excess_return', float(on['excess_return']), source=src)
+        _ps_update('finrl_deepseek.ablation_on_ir_bear_2022', float(on['ir_bear_2022']), source=src)
+        _ps_update('finrl_deepseek.ablation_bench_total_return', float(on['bench_total_return']), source=src)
+        logger.info("✅ ParamStore 已写入 ablation_llm_risk_* + 论文口径指标 (8 keys)")
     except ImportError:
         logger.warning("pkg.params 不可用，跳过 ParamStore 写入（本地 dry-run）")
 
